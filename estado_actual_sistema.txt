@@ -1,0 +1,79 @@
+ESTADO ACTUAL DEL SISTEMA EMBEBIDO
+Proyecto: Deteccion de somnolencia en Raspberry Pi
+Fecha de documento: 2026-02-19
+Estado: Prototipo funcional en fase de desarrollo
+
+1. DESCRIPCION DEL HARDWARE ACTUALMENTE CONECTADO
+- Unidad de procesamiento: Raspberry Pi 4.
+- Captura de video: Camara Arducam IMX519 conectada al puerto CSI.
+- Salida de alerta: Buzzer conectado a un pin GPIO de la Raspberry Pi.
+
+2. INTERCONEXION ACTUAL DE COMPONENTES
+- La Arducam IMX519 se conecta fisicamente al conector CSI de la Raspberry Pi 4 mediante cinta FFC.
+- El buzzer esta cableado a un GPIO de salida y GND en la Raspberry Pi.
+- La Raspberry Pi ejecuta el procesamiento de imagen y la logica de deteccion.
+
+3. ESTADO ACTUAL DEL ENSAMBLAJE FISICO
+- Ensamblaje base completado para pruebas funcionales de captura y procesamiento.
+- Camara CSI instalada y operativa a nivel de software (Picamera2).
+- Buzzer fisicamente instalado como actuador de alerta en el prototipo.
+- El sistema se encuentra en banco de pruebas, no en encapsulado final.
+
+4. ENTORNO DE EJECUCION
+- Sistema operativo objetivo del prototipo: Raspberry Pi OS.
+- Version de Python objetivo/instalada en el entorno del prototipo: Python 3.12.
+- Ejecucion principal en script Python con procesamiento en tiempo real de frames de camara.
+
+5. LIBRERIAS INSTALADAS Y FUNCION EN EL SISTEMA
+- OpenCV (`cv2`):
+  - Conversion de espacios de color.
+  - Render de overlays, panel de metricas y ventana de monitoreo.
+  - Soporte matematico para estimacion de pose de cabeza (solvePnP).
+- MediaPipe:
+  - Deteccion y seguimiento de landmarks faciales (Face Mesh).
+  - Deteccion de manos para evento de frotado de ojos.
+- NumPy:
+  - Operaciones vectoriales y calculo geometrico de distancias/centros.
+- SciPy (`scipy.spatial.distance`):
+  - Distancias euclidianas usadas en calculo de EAR y MAR.
+- Picamera2:
+  - Inicializacion de camara CSI, configuracion de video y captura continua de frames.
+- Dependencia de sistema (`espeak`):
+  - Generacion de alerta sonora por voz en la implementacion actual.
+
+6. ESTADO TECNICO DE LO QUE FUNCIONA ACTUALMENTE
+Implementado y funcionando en codigo actual:
+- Captura continua desde camara CSI.
+- Deteccion de rostro y malla facial (Face Mesh).
+- Calculo de EAR (Eye Aspect Ratio) por ojo y promedio.
+- Deteccion de cierre prolongado de ojos por umbral de EAR + frames consecutivos.
+- Calculo de MAR para deteccion de evento de bostezo.
+- Estimacion de pose de cabeza (pitch, yaw, roll) y deteccion de cabeceo.
+- Deteccion de mano cerca de ojos para evento de frotado.
+- Visualizacion en tiempo real con panel de metricas y estados.
+- Activacion de alerta sonora en estado de sueno detectado.
+
+7. FLUJO REAL ACTUAL DEL SISTEMA (CAPTURA -> ALERTA)
+1. Picamera2 captura un frame desde la Arducam IMX519.
+2. El frame se normaliza a BGR y se convierte a RGB para MediaPipe.
+3. Face Mesh detecta landmarks faciales.
+4. Se calcula EAR y se compara contra umbral de somnolencia.
+5. Si EAR permanece bajo durante N frames consecutivos, se activa estado de alerta.
+6. En alerta, el sistema dispara salida sonora (actualmente mediante `espeak`) y marca visual roja en pantalla.
+7. Si el EAR vuelve a estado normal, la alerta se desactiva.
+
+8. LIMITACIONES ACTUALES DEL SISTEMA
+- El buzzer esta conectado fisicamente, pero en el codigo actual no hay control directo por GPIO; la salida activa implementada hoy es por `espeak`.
+- PERCLOS aparece en material de referencia del proyecto, pero no esta integrado en el pipeline ejecutable actual (`fatiga.py`).
+- No hay servicio/background daemon ni manejo de arranque automatico documentado en esta version.
+- El sistema depende de condiciones de iluminacion y posicion frontal del rostro para mantener deteccion estable.
+- Parametros de umbral son fijos/cargados desde archivo de texto y no hay calibracion automatica por usuario.
+
+9. ELEMENTOS AUN NO IMPLEMENTADOS EN LA VERSION ACTUAL
+- Activacion real del buzzer via libreria GPIO (`RPi.GPIO` o equivalente) dentro del flujo de alerta.
+- Integracion operativa de PERCLOS en el script principal de ejecucion.
+- Publicacion de eventos/metricas por red (por ejemplo MQTT) en el flujo principal activo.
+- Empaquetado final de despliegue (servicio del sistema + tolerancia completa a fallos de campo).
+
+Resumen ejecutivo:
+El sistema actual ya funciona como prototipo de deteccion de somnolencia en desarrollo sobre Raspberry Pi OS, con analisis facial en tiempo real y activacion de alerta sonora. La base de captura, analitica visual y deteccion de cierre prolongado de ojos esta operativa; la salida por GPIO del buzzer y la metrica PERCLOS aun no forman parte del ejecutable principal en uso.

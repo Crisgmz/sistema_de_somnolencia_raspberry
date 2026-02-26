@@ -1,0 +1,629 @@
+SOMNOALERT - PAQUETE PARA RASPBERRY PI (FACE + MQTT + VISUAL)
+==============================================================
+
+Objetivo:
+- Entregar un TXT unico para integrar en Raspberry Pi.
+- Incluir deteccion facial visual, metricas completas de rostro y MQTT.
+- Mantener compatibilidad con el payload actual del proyecto.
+
+----------------------------------------------------------------------
+1) PROMPT LISTO PARA OTRA IA
+----------------------------------------------------------------------
+Integra este bloque en mi proyecto actual sin romper funcionalidades existentes.
+Requisitos:
+1. Mantener payload legacy:
+   - flicker.count/report
+   - micro_sleep.count/report/eyes_closed/eyes_closed_duration/eyes_closed_alarm
+   - yawn.count/report
+   - pitch.count/report/head_down
+2. Agregar metricas avanzadas:
+   - EAR izq/der/promedio + estado de ojos
+   - Parpadeos (duracion, tipo, frecuencia, BPM, contadores)
+   - PERCLOS y nivel
+   - MAR + estado de boca + bostezos
+   - pitch/yaw/roll + estado de cabeza + cabeceos + estabilidad
+   - drowsiness_score, drowsiness_level, alert_reasons
+3. Publicar en MQTT usando la conexion del proyecto.
+4. Conservar visualizacion OpenCV con malla facial.
+5. Entregar archivos finales ya integrados y ejecutables.
+
+----------------------------------------------------------------------
+2) VARIABLES .env SUGERIDAS EN PI
+----------------------------------------------------------------------
+MQTT_BROKER=hbc0fc94.ala.us-east-1.emqxsl.com
+MQTT_PORT=8883
+MQTT_TOPIC=test/connection
+MQTT_USERNAME=Cristian
+MQTT_PASSWORD=Noviembre0824@
+MQTT_QOS=1
+MQTT_CLIENT_ID=raspi-somnoalert-001
+MQTT_CA_CERT=certs/emqxsl-ca.crt
+CAMERA_INDEX=0
+
+----------------------------------------------------------------------
+3) ARCHIVO SUGERIDO: raspberry_pi_face_mqtt_visual.py
+----------------------------------------------------------------------
+```python
+import json
+import os
+import ssl
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import mediapipe as mp
+import numpy as np
+from paho.mqtt import client as mqtt_client
+
+
+class PiMqttPublisher:
+    def __init__(self):
+        self.broker = os.getenv("MQTT_BROKER", "hbc0fc94.ala.us-east-1.emqxsl.com")
+        self.port = int(os.getenv("MQTT_PORT", "8883"))
+        self.topic = os.getenv("MQTT_TOPIC", "test/connection")
+        self.username = os.getenv("MQTT_USERNAME", "Cristian")
+        self.password = os.getenv("MQTT_PASSWORD", "Noviembre0824@")
+        self.qos = int(os.getenv("MQTT_QOS", "1"))
+        self.client_id = os.getenv("MQTT_CLIENT_ID", f"raspi-mqtt-{int(time.time())}")
+        cert_candidates = [
+            os.getenv("MQTT_CA_CERT", ""),
+            os.path.join("certs", "emqxsl-ca.crt"),
+            os.path.join("certs", "certificate.crt"),
+        ]
+        self.ca_cert = next((p for p in cert_candidates if p and os.path.exists(p)), None)
+        self.client = None
+        self.connected = False
+        self.use_ssl = self.port in (8883, 8884)
+        self._connect()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self.connected = rc == 0
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.connected = False
+
+    def _connect(self):
+        try:
+            self.client = mqtt_client.Client(client_id=self.client_id, protocol=mqtt_client.MQTTv311)
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
+            if self.username:
+                self.client.username_pw_set(self.username, self.password)
+            if self.use_ssl:
+                if self.ca_cert:
+                    self.client.tls_set(ca_certs=self.ca_cert, cert_reqs=ssl.CERT_REQUIRED)
+                else:
+                    self.client.tls_set()
+            self.client.connect(self.broker, self.port, keepalive=60)
+            self.client.loop_start()
+        except Exception:
+            self.client = None
+
+    def publish_report(self, report: Dict):
+        if not self.client or not self.connected:
+            return
+        self.client.publish(self.topic, json.dumps(report, ensure_ascii=False), qos=self.qos)
+
+    def disconnect(self):
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+        self.connected = False
+
+
+LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+MOUTH_IDX = [61, 291, 0, 17, 84, 314, 405, 321]
+POSE_IDX = [1, 152, 33, 263, 61, 291]
+
+
+def dist(a, b): return float(np.linalg.norm(a - b))
+
+
+def ear(eye):
+    if len(eye) < 6: return 0.0
+    A = dist(eye[1], eye[5]); B = dist(eye[2], eye[4]); C = dist(eye[0], eye[3])
+    return (A + B) / (2.0 * C) if C > 0 else 0.0
+
+
+def mar(mouth):
+    if len(mouth) < 8: return 0.0
+    A = dist(mouth[1], mouth[7]); B = dist(mouth[2], mouth[6]); C = dist(mouth[3], mouth[5]); D = dist(mouth[0], mouth[4])
+    return (A + B + C) / (2.0 * D) if D > 0 else 0.0
+
+
+def eye_state(v):
+    if v < 0.22: return "closed"
+    if v < 0.28: return "drowsy"
+    if v < 0.30: return "normal"
+    return "wide_open"
+
+
+def mouth_state(v):
+    if v < 0.10: return "closed"
+    if v < 0.25: return "slightly_open"
+    if v < 0.35: return "talking"
+    return "yawning"
+
+
+def rot_to_euler(R):
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(R[2, 1], R[2, 2]); y = np.arctan2(-R[2, 0], sy); z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1]); y = np.arctan2(-R[2, 0], sy); z = 0
+    return float(np.degrees(x)), float(np.degrees(y)), float(np.degrees(z))
+
+
+def head_pose(landmarks_px, shape):
+    model = np.array([
+        (0.0, 0.0, 0.0), (0.0, -330.0, -65.0), (-225.0, 170.0, -135.0),
+        (225.0, 170.0, -135.0), (-150.0, -150.0, -125.0), (150.0, -150.0, -125.0)
+    ], dtype=np.float64)
+    img_pts = np.array([landmarks_px[i] for i in POSE_IDX], dtype=np.float64)
+    h, w = shape[:2]
+    K = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
+    ok, rvec, _ = cv2.solvePnP(model, img_pts, K, np.zeros((4, 1)), flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok: return 0.0, 0.0, 0.0
+    R, _ = cv2.Rodrigues(rvec)
+    return rot_to_euler(R)
+
+
+class PiFaceDrowsinessDetector:
+    def __init__(self, enable_mqtt=True):
+        self.mqtt = PiMqttPublisher() if enable_mqtt else None
+        self.mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.6, min_tracking_confidence=0.6
+        )
+        self.draw = mp.solutions.drawing_utils
+        self.spec = self.draw.DrawingSpec(color=(255, 255, 0), thickness=1, circle_radius=1)
+
+        self.frame_id = 0
+        self.last_pub = 0.0
+        self.pub_interval = 0.20
+
+        self.blink_active = False
+        self.blink_start = None
+        self.blink_ts = deque(maxlen=3000)
+        self.total_blinks = 0
+        self.normal_blinks = 0
+        self.prolonged_blinks = 0
+        self.critical_blinks = 0
+
+        self.ear_hist = deque(maxlen=5000)  # (ts, ear)
+
+        self.yawn_active = False
+        self.yawn_start = None
+        self.last_yawn = None
+        self.yawn_ts = deque(maxlen=300)
+        self.total_yawns = 0
+
+        self.nod_active = False
+        self.nod_start = None
+        self.nod_ts = deque(maxlen=300)
+        self.total_nods = 0
+        self.pitch_hist = deque(maxlen=3000)
+        self.yaw_hist = deque(maxlen=3000)
+        self.roll_hist = deque(maxlen=3000)
+
+    def _update_blink(self, ear_value, ts):
+        blink_detected = False
+        blink_duration_ms = 0.0
+        blink_type = None
+
+        if ear_value < 0.22 and not self.blink_active:
+            self.blink_active = True
+            self.blink_start = ts
+        elif ear_value >= 0.22 and self.blink_active:
+            self.blink_active = False
+            if self.blink_start is not None:
+                blink_duration_ms = (ts - self.blink_start) * 1000.0
+                self.blink_start = None
+                blink_detected = True
+                self.total_blinks += 1
+                self.blink_ts.append(ts)
+                if blink_duration_ms < 100:
+                    blink_type = "too_fast"
+                elif blink_duration_ms <= 300:
+                    blink_type = "normal"; self.normal_blinks += 1
+                elif blink_duration_ms < 400:
+                    blink_type = "prolonged"; self.prolonged_blinks += 1
+                else:
+                    blink_type = "critical"; self.critical_blinks += 1
+
+        while self.blink_ts and (ts - self.blink_ts[0]) > 60:
+            self.blink_ts.popleft()
+        if len(self.blink_ts) >= 2:
+            span = ts - self.blink_ts[0]
+            hz = len(self.blink_ts) / span if span > 0 else 0.0
+        else:
+            hz = 0.0
+        return {
+            "blink_detected": blink_detected,
+            "blink_duration_ms": float(blink_duration_ms),
+            "blink_type": blink_type,
+            "blink_frequency_hz": float(hz),
+            "blinks_per_minute": float(hz * 60.0),
+        }
+
+    def _update_perclos(self, ear_value, ts):
+        self.ear_hist.append((ts, ear_value))
+        while self.ear_hist and (ts - self.ear_hist[0][0]) > 60:
+            self.ear_hist.popleft()
+        if not self.ear_hist:
+            p = 0.0
+        else:
+            closed = sum(1 for _, v in self.ear_hist if v < 0.28)
+            p = closed / float(len(self.ear_hist))
+
+        if p < 0.15: lvl = "alert"
+        elif p < 0.20: lvl = "normal"
+        elif p < 0.35: lvl = "warning"
+        elif p < 0.50: lvl = "drowsy"
+        else: lvl = "critical"
+        return p, lvl
+
+    def _update_yawn(self, mar_value, ts):
+        detected = False
+        in_progress = False
+        duration = 0.0
+
+        if self.last_yawn is not None and (ts - self.last_yawn) < 3.0:
+            pass
+        elif mar_value >= 0.35 and not self.yawn_active:
+            self.yawn_active = True
+            self.yawn_start = ts
+            in_progress = True
+        elif mar_value < 0.35 and self.yawn_active:
+            self.yawn_active = False
+            if self.yawn_start is not None:
+                duration = ts - self.yawn_start
+                self.yawn_start = None
+                if 0.5 <= duration <= 6.0:
+                    self.total_yawns += 1
+                    self.last_yawn = ts
+                    self.yawn_ts.append(ts)
+                    detected = True
+        elif self.yawn_active and self.yawn_start is not None:
+            in_progress = True
+            duration = ts - self.yawn_start
+
+        y1 = sum(1 for t in self.yawn_ts if (ts - t) <= 60)
+        y5 = sum(1 for t in self.yawn_ts if (ts - t) <= 300)
+        return detected, in_progress, float(duration), int(y1), int(y5)
+
+    def _update_head(self, pitch, yaw, roll, ts):
+        self.pitch_hist.append(pitch); self.yaw_hist.append(yaw); self.roll_hist.append(roll)
+
+        if pitch > 30: head_state = "critical_drop"
+        elif pitch > 20: head_state = "drowsy_drop"
+        elif abs(roll) > 30: head_state = "excessive_tilt"
+        elif abs(yaw) > 40: head_state = "excessive_turn"
+        else: head_state = "normal"
+
+        nod_detected = False
+        nod_duration = 0.0
+        if pitch > 20 and not self.nod_active:
+            self.nod_active = True
+            self.nod_start = ts
+        elif pitch < 15 and self.nod_active:
+            self.nod_active = False
+            if self.nod_start is not None:
+                nod_duration = ts - self.nod_start
+                self.nod_start = None
+                if 0.3 <= nod_duration <= 3.0:
+                    self.total_nods += 1
+                    self.nod_ts.append(ts)
+                    nod_detected = True
+
+        n1 = sum(1 for t in self.nod_ts if (ts - t) <= 60)
+        if len(self.pitch_hist) < 10:
+            stability = 1.0
+        else:
+            s = (np.std(self.pitch_hist) + np.std(self.yaw_hist) + np.std(self.roll_hist)) / 3.0
+            stability = max(0.0, 1.0 - (s / 20.0))
+
+        return {
+            "head_state": head_state,
+            "nod_detected": nod_detected,
+            "head_drop_detected": pitch > 20,
+            "excessive_tilt": abs(roll) > 30 or abs(yaw) > 40,
+            "nods_last_minute": int(n1),
+            "head_stability": float(stability),
+        }
+
+    def _score(self, eye_state_v, perclos, perclos_level, blink, yawn, head):
+        score = 0.0
+        reasons = []
+        if perclos_level == "critical": score += 35; reasons.append("PERCLOS critico")
+        elif perclos_level == "drowsy": score += 25; reasons.append("PERCLOS alto")
+        elif perclos_level == "warning": score += 15; reasons.append("PERCLOS warning")
+
+        if eye_state_v == "closed": score += 20; reasons.append("Ojos cerrados")
+        elif eye_state_v == "drowsy": score += 10; reasons.append("Ojos somnolientos")
+
+        if self.critical_blinks > 0: score += 15 * min(self.critical_blinks, 3); reasons.append("Parpadeos criticos")
+        if self.prolonged_blinks > 2: score += 10; reasons.append("Parpadeos prolongados")
+        if blink["blink_type"] == "critical": score += 10; reasons.append("Parpadeo critico actual")
+        bpm = blink["blinks_per_minute"]
+        if bpm > 0 and bpm < 6: score += 8; reasons.append("BPM bajo")
+        elif bpm > 35: score += 5; reasons.append("BPM alto")
+
+        if yawn["yawn_detected"]: score += 12; reasons.append("Bostezo detectado")
+        if yawn["yawns_last_minute"] >= 2: score += 15; reasons.append("2+ bostezos/min")
+        elif yawn["yawns_last_minute"] == 1: score += 8; reasons.append("1 bostezo/min")
+        if yawn["yawns_last_5_minutes"] >= 3: score += 10; reasons.append("3+ bostezos/5min")
+
+        if head["head_state"] == "critical_drop": score += 25; reasons.append("Caida critica cabeza")
+        elif head["head_state"] == "drowsy_drop": score += 15; reasons.append("Caida cabeza")
+        if head["nod_detected"]: score += 12; reasons.append("Cabeceo")
+        if head["nods_last_minute"] >= 3: score += 15; reasons.append("3+ cabeceos/min")
+        elif head["nods_last_minute"] >= 2: score += 8; reasons.append("2+ cabeceos/min")
+        if head["excessive_tilt"]: score += 8; reasons.append("Inclinacion excesiva")
+        if head["head_stability"] < 0.5: score += 10; reasons.append("Cabeza inestable")
+
+        score = min(100.0, score)
+        if score >= 80: level = "CRITICAL"; alert = True
+        elif score >= 60: level = "HIGH"; alert = True
+        elif score >= 40: level = "MEDIUM"; alert = True
+        else: level = "LOW"; alert = False
+
+        if perclos > 0.5 and eye_state_v == "closed":
+            level = "CRITICAL"; alert = True; reasons.append("Regla critica ojos cerrados + PERCLOS")
+
+        simultaneous = sum([
+            perclos > 0.35,
+            self.critical_blinks > 0,
+            yawn["yawns_last_minute"] > 0,
+            head["head_drop_detected"],
+            head["nods_last_minute"] > 1,
+        ])
+        if simultaneous >= 3:
+            if level not in ("CRITICAL", "HIGH"): level = "HIGH"
+            alert = True
+            reasons.append(f"Multiples indicadores: {simultaneous}")
+
+        return float(score), level, alert, reasons
+
+    def process_frame(self, frame):
+        self.frame_id += 1
+        ts = time.time()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        out = frame.copy()
+        result = self.mesh.process(rgb)
+
+        if not result.multi_face_landmarks:
+            payload = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "frame_id": self.frame_id,
+                "face_detected": False,
+                "drowsiness_score": 0.0,
+                "drowsiness_level": "LOW",
+                "alert_triggered": False,
+                "alert_reasons": ["No face detected"],
+            }
+            return out, payload
+
+        lm = result.multi_face_landmarks[0]
+        self.draw.draw_landmarks(out, lm, mp.solutions.face_mesh.FACEMESH_TESSELATION, self.spec, self.spec)
+
+        h, w = out.shape[:2]
+        lnorm = np.array([[p.x, p.y] for p in lm.landmark], dtype=np.float32)
+        lpx = np.array([[p.x * w, p.y * h] for p in lm.landmark], dtype=np.float32)
+        le = lnorm[LEFT_EYE_IDX]; re = lnorm[RIGHT_EYE_IDX]; mo = lnorm[MOUTH_IDX]
+
+        ear_left = ear(le); ear_right = ear(re); ear_avg = (ear_left + ear_right) / 2.0
+        eye_st = eye_state(ear_avg)
+        blink = self._update_blink(ear_avg, ts)
+        perclos, perclos_level = self._update_perclos(ear_avg, ts)
+        mar_v = mar(mo); mouth_st = mouth_state(mar_v)
+        yawn_det, yawn_prog, yawn_dur, yawn_1m, yawn_5m = self._update_yawn(mar_v, ts)
+        pitch, yaw, roll = head_pose(lpx, out.shape)
+        head = self._update_head(pitch, yaw, roll, ts)
+
+        yawn_info = {
+            "yawn_detected": yawn_det,
+            "yawn_in_progress": yawn_prog,
+            "yawn_duration": yawn_dur,
+            "yawns_last_minute": yawn_1m,
+            "yawns_last_5_minutes": yawn_5m,
+        }
+        score, level, alert, reasons = self._score(eye_st, perclos, perclos_level, blink, yawn_info, head)
+
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "frame_id": self.frame_id,
+            "face_detected": True,
+            "ear": float(ear_avg),
+            "ear_left": float(ear_left),
+            "ear_right": float(ear_right),
+            "eye_state": eye_st,
+            "blink_detected": bool(blink["blink_detected"]),
+            "blink_duration_ms": float(blink["blink_duration_ms"]),
+            "blink_type": blink["blink_type"],
+            "blink_frequency_hz": float(blink["blink_frequency_hz"]),
+            "blinks_per_minute": float(blink["blinks_per_minute"]),
+            "total_blinks": int(self.total_blinks),
+            "normal_blinks": int(self.normal_blinks),
+            "prolonged_blinks": int(self.prolonged_blinks),
+            "critical_blinks": int(self.critical_blinks),
+            "perclos": float(perclos),
+            "perclos_level": perclos_level,
+            "mar": float(mar_v),
+            "mouth_state": mouth_st,
+            "yawn_detected": bool(yawn_det),
+            "yawn_in_progress": bool(yawn_prog),
+            "yawn_duration": float(yawn_dur),
+            "yawns_last_minute": int(yawn_1m),
+            "yawns_last_5_minutes": int(yawn_5m),
+            "total_yawns": int(self.total_yawns),
+            "head_pitch": float(pitch),
+            "head_yaw": float(yaw),
+            "head_roll": float(roll),
+            "head_state": head["head_state"],
+            "nod_detected": bool(head["nod_detected"]),
+            "head_drop_detected": bool(head["head_drop_detected"]),
+            "excessive_tilt": bool(head["excessive_tilt"]),
+            "nods_last_minute": int(head["nods_last_minute"]),
+            "total_nods": int(self.total_nods),
+            "head_stability": float(head["head_stability"]),
+            "drowsiness_score": float(score),
+            "drowsiness_level": level,
+            "alert_triggered": bool(alert),
+            "alert_reasons": reasons,
+            # Legacy compatible
+            "flicker": {"count": int(self.total_blinks), "report": bool(blink["blink_detected"])},
+            "micro_sleep": {
+                "count": int(self.critical_blinks),
+                "report": bool(blink["blink_type"] == "critical"),
+                "eyes_closed": bool(eye_st == "closed"),
+                "eyes_closed_duration": float((ts - self.blink_start) if self.blink_active and self.blink_start else 0.0),
+                "eyes_closed_alarm": bool(eye_st == "closed" and self.blink_active and self.blink_start and (ts - self.blink_start) >= 3.0),
+            },
+            "yawn": {"count": int(self.total_yawns), "report": bool(yawn_det)},
+            "pitch": {"count": int(self.total_nods), "report": bool(head["nod_detected"]), "head_down": bool(head["head_drop_detected"])},
+        }
+
+        color = (0, 255, 0)
+        if level == "MEDIUM": color = (0, 255, 255)
+        elif level == "HIGH": color = (0, 165, 255)
+        elif level == "CRITICAL": color = (0, 0, 255)
+
+        cv2.rectangle(out, (10, 10), (560, 230), (30, 30, 30), -1)
+        cv2.rectangle(out, (10, 10), (560, 230), color, 2)
+        lines = [
+            f"Level={level} Score={score:.1f}",
+            f"EAR={ear_avg:.3f} (L={ear_left:.3f}, R={ear_right:.3f}) Eye={eye_st}",
+            f"PERCLOS={perclos*100:.1f}% ({perclos_level})",
+            f"Blink={blink['blink_type']} dur={blink['blink_duration_ms']:.0f}ms BPM={blink['blinks_per_minute']:.1f}",
+            f"MAR={mar_v:.3f} Mouth={mouth_st} Yawn={self.total_yawns}",
+            f"Pitch={pitch:.1f} Yaw={yaw:.1f} Roll={roll:.1f} Nods={self.total_nods}",
+            f"CriticalBlinks={self.critical_blinks} Alert={alert}",
+        ]
+        y0 = 30
+        for line in lines:
+            cv2.putText(out, line, (18, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1, cv2.LINE_AA)
+            y0 += 27
+
+        for i in (LEFT_EYE_IDX + RIGHT_EYE_IDX + MOUTH_IDX + POSE_IDX):
+            x, y = lpx[i]
+            cv2.circle(out, (int(x), int(y)), 2, (0, 255, 255), -1)
+
+        publish_now = (
+            (ts - self.last_pub >= self.pub_interval)
+            or alert
+            or blink["blink_detected"]
+            or yawn_det
+            or head["nod_detected"]
+        )
+        if publish_now and self.mqtt:
+            self.mqtt.publish_report(payload)
+            self.last_pub = ts
+
+        return out, payload
+
+    def close(self):
+        try: self.mesh.close()
+        except Exception: pass
+        if self.mqtt: self.mqtt.disconnect()
+
+
+def open_camera(index=0):
+    for idx in [index, 0, 1, 2]:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            return cap
+        cap.release()
+    raise RuntimeError("No se pudo abrir la camara")
+
+
+def run_live():
+    detector = PiFaceDrowsinessDetector(enable_mqtt=True)
+    cap = open_camera(int(os.getenv("CAMERA_INDEX", "0")))
+    last_log = 0.0
+    try:
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok: break
+            out, payload = detector.process_frame(frame)
+            cv2.imshow("SomnoAlert Pi - Face + MQTT", out)
+            if time.time() - last_log > 1.5:
+                print(
+                    f"level={payload.get('drowsiness_level')} score={payload.get('drowsiness_score', 0):.1f} "
+                    f"EAR={payload.get('ear', 0):.3f} PERCLOS={payload.get('perclos', 0)*100:.1f}%"
+                )
+                last_log = time.time()
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord("q"): break
+            if k == ord("p"): print(json.dumps(payload, indent=2, ensure_ascii=False))
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        detector.close()
+
+
+if __name__ == "__main__":
+    run_live()
+```
+
+----------------------------------------------------------------------
+4) OPCIONAL - WEBSOCKET FASTAPI
+----------------------------------------------------------------------
+```python
+import base64
+import cv2
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from raspberry_pi_face_mqtt_visual import PiFaceDrowsinessDetector
+
+app = FastAPI()
+system = PiFaceDrowsinessDetector(enable_mqtt=True)
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            frame_b64 = await websocket.receive_text()
+            frame = cv2.imdecode(np.frombuffer(base64.b64decode(frame_b64), np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+            out, payload = system.process_frame(frame)
+            _, buff = cv2.imencode(".jpg", out)
+            await websocket.send_json({
+                "annotated_image": base64.b64encode(buff).decode("utf-8"),
+                "json_report": payload
+            })
+    except WebSocketDisconnect:
+        pass
+```
+
+----------------------------------------------------------------------
+5) DEPENDENCIAS / EJECUCION EN PI
+----------------------------------------------------------------------
+```bash
+sudo apt update
+sudo apt install -y python3-pip python3-venv libatlas-base-dev libopenblas-dev libjpeg-dev
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install numpy opencv-python mediapipe paho-mqtt fastapi uvicorn websockets
+python raspberry_pi_face_mqtt_visual.py
+```
+
+----------------------------------------------------------------------
+6) PARAMETROS FACIALES CUBIERTOS
+----------------------------------------------------------------------
+- Face mesh completo (visual + puntos clave).
+- EAR, estado de ojos, parpadeos, BPM, parpadeos criticos.
+- PERCLOS.
+- MAR, estado de boca, bostezos.
+- Pitch, Yaw, Roll, cabeceos, estabilidad.
+- Score final de somnolencia y razones de alerta.
+- MQTT continuo + payload legacy + avanzado.
