@@ -1,0 +1,179 @@
+SOMNOALERT - PLANTILLA UNICA MQTT + SUPABASE (LISTA PARA PEGAR)
+================================================================
+
+INSTRUCCIONES RAPIDAS
+1) Completa la seccion A con tus datos reales de MQTT.
+2) Completa la seccion B con tus datos reales de Supabase.
+3) Copia y pega la seccion C en Supabase SQL Editor y ejecútala.
+4) Si usas RLS, aplica la seccion D.
+
+
+A) DATOS REQUERIDOS DE MQTT (ENVIAME ESTO)
+-------------------------------------------
+# Conexion broker
+EMQX_HOST=
+EMQX_PORT=8883
+EMQX_USERNAME=
+EMQX_PASSWORD=
+EMQX_TLS=true
+
+# Enrutamiento/identidad
+MQTT_TOPIC=fleet/{vehicle_id}/telemetry
+VEHICLE_ID=
+DRIVER_ID=
+MQTT_CLIENT_ID=raspi-somnoalert-001
+MQTT_QOS=1
+
+# Certificado (si aplica)
+MQTT_CA_CERT_PATH=
+
+
+B) DATOS REQUERIDOS DE SUPABASE (ENVIAME ESTO)
+-----------------------------------------------
+SUPABASE_URL=
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_DB_PASSWORD=
+
+# Opcional (si tu app los usa)
+SUPABASE_PROJECT_ID=
+SUPABASE_SCHEMA=public
+
+
+C) SQL BASE DE DATOS (PEGAR EN SUPABASE SQL EDITOR)
+----------------------------------------------------
+-- Extensiones utiles para UUID aleatorio
+create extension if not exists pgcrypto;
+
+-- 1) sessions
+create table if not exists public.sessions (
+  id uuid primary key default gen_random_uuid(),
+  vehicle_id text not null,
+  driver_id text not null,
+  start_time timestamptz not null,
+  end_time timestamptz,
+  max_fatigue int,
+  alert_count int default 0,
+  created_at timestamptz default now()
+);
+
+-- 2) metrics_summary (1 fila por minuto)
+create table if not exists public.metrics_summary (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid references public.sessions(id) on delete set null,
+  timestamp timestamptz not null,
+  avg_ear float,
+  avg_mar float,
+  avg_pitch float,
+  perclos float,
+  blink_freq float,
+  fatigue_score int,
+  illumination text,
+  time_on_task int,
+  monotony_index int
+);
+
+-- 3) events (1 fila por evento)
+create table if not exists public.events (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid references public.sessions(id) on delete set null,
+  timestamp timestamptz not null,
+  event_type text not null,
+  severity_level int,
+  param_value float,
+  duration_ms int,
+  fatigue_score int
+);
+
+-- 4) emergency_alerts (envio inmediato)
+create table if not exists public.emergency_alerts (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid references public.sessions(id) on delete set null,
+  timestamp timestamptz not null,
+  emergency_type text not null,
+  trigger_params jsonb,
+  duration_seconds float,
+  resolved_at timestamptz,
+  resolution_type text
+);
+
+-- Indices recomendados
+create index if not exists idx_sessions_vehicle_start on public.sessions(vehicle_id, start_time desc);
+create index if not exists idx_metrics_session_ts on public.metrics_summary(session_id, timestamp desc);
+create index if not exists idx_events_session_ts on public.events(session_id, timestamp desc);
+create index if not exists idx_events_type_ts on public.events(event_type, timestamp desc);
+create index if not exists idx_emergency_session_ts on public.emergency_alerts(session_id, timestamp desc);
+create index if not exists idx_emergency_type_ts on public.emergency_alerts(emergency_type, timestamp desc);
+
+
+D) RLS MINIMO (OPCIONAL, SI LO NECESITAS)
+-----------------------------------------
+-- Si usas backend con service_role para insertar, puedes habilitar RLS
+-- y dejar politicas de lectura para usuarios autenticados.
+
+alter table public.sessions enable row level security;
+alter table public.metrics_summary enable row level security;
+alter table public.events enable row level security;
+alter table public.emergency_alerts enable row level security;
+
+-- Lectura autenticada (ajusta segun tu app)
+do $$
+begin
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='sessions' and policyname='read_sessions_auth') then
+    create policy "read_sessions_auth" on public.sessions for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='metrics_summary' and policyname='read_metrics_auth') then
+    create policy "read_metrics_auth" on public.metrics_summary for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='events' and policyname='read_events_auth') then
+    create policy "read_events_auth" on public.events for select to authenticated using (true);
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='emergency_alerts' and policyname='read_emergency_auth') then
+    create policy "read_emergency_auth" on public.emergency_alerts for select to authenticated using (true);
+  end if;
+end $$;
+
+-- Insercion via service role (normalmente no requiere policy explicita porque bypass RLS).
+
+
+E) INSERTS DE PRUEBA (OPCIONAL)
+--------------------------------
+-- 1) Crear sesion de prueba
+insert into public.sessions (vehicle_id, driver_id, start_time, max_fatigue, alert_count)
+values ('truck_042', 'driver_007', now(), 0, 0)
+returning id;
+
+-- 2) Usar el id devuelto para pruebas:
+-- reemplaza <SESSION_ID>
+insert into public.metrics_summary (
+  session_id, timestamp, avg_ear, avg_mar, avg_pitch, perclos, blink_freq,
+  fatigue_score, illumination, time_on_task, monotony_index
+)
+values (
+  '<SESSION_ID>', now(), 0.28, 0.31, 8.2, 0.09, 14,
+  45, 'day', 47, 3
+);
+
+insert into public.events (
+  session_id, timestamp, event_type, severity_level, param_value, duration_ms, fatigue_score
+)
+values (
+  '<SESSION_ID>', now(), 'YAWN', 2, 0.35, 1800, 45
+);
+
+insert into public.emergency_alerts (
+  session_id, timestamp, emergency_type, trigger_params, duration_seconds, resolution_type
+)
+values (
+  '<SESSION_ID>', now(), 'CONVULSIVE_EPISODE', '{"pitch_hz":4.1,"power_ratio":0.62}', 7.5, 'manual_reset'
+);
+
+
+F) CHECKLIST DE ENTREGA (PARA QUE TODO FUNCIONE)
+-------------------------------------------------
+[ ] MQTT conecta con TLS en puerto correcto
+[ ] Topic final = fleet/<vehicle_id>/telemetry
+[ ] session_id se crea al iniciar y se reutiliza en metrics/events/emergency
+[ ] Supabase URL y keys cargadas en .env
+[ ] Tablas creadas sin error en SQL Editor
+[ ] Inserciones de prueba ejecutan OK
