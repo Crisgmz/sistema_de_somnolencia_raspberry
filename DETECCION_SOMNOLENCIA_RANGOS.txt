@@ -1,0 +1,118 @@
+DETECCION DE SOMNOLENCIA - CRITERIOS Y RANGOS DE TIEMPO
+
+1) CONDICION PREVIA PARA QUE LOS EVENTOS CUENTEN
+- El sistema exige calibracion inicial antes de activar la mayoria de banderas de evento.
+- Tiempo de calibracion en ejecucion: 300 segundos (5 minutos).
+- Durante ese tiempo ajusta baseline de EAR y MAR.
+
+2) METRICAS PRINCIPALES Y UMBRALES
+2.1 Ojos
+- PERCLOS:
+  - Ventana: 60 s.
+  - Evento cuando: PERCLOS >= 0.25.
+- BLINK_TC (duracion de cierre/parpadeo):
+  - Se considera parpadeo valido si dura entre 0.06 s y 0.8 s.
+  - Evento cuando: BLINK_TC >= 500 ms.
+- BLINK_FB (frecuencia de parpadeo en ventana):
+  - Ventana: 60 s (conteo por minuto).
+  - Evento cuando: < 6 parp/min o > 28 parp/min.
+- IBI (intervalo entre parpadeos):
+  - Evento cuando: IBI >= 6 s.
+- BLINK_AMPLITUDE:
+  - Evento cuando: 0 < amplitud < 0.035.
+- REOPEN_SPEED:
+  - Evento cuando: 0 < velocidad < 0.12.
+- FIXATION:
+  - Reinicia cuando velocidad ocular > 28 px/s.
+  - Evento cuando: fijacion >= 6 s.
+
+2.2 Boca
+- MAR:
+  - Umbral dinamico: max(0.30, baseline_MAR * 1.25).
+  - Evento cuando: MAR >= umbral.
+- YAWN_FREQ:
+  - Evento cuando: conteo de bostezos >= 3.
+- YAWN_DUR:
+  - Evento cuando: duracion del bostezo >= 1.5 s.
+
+2.3 Cabeza
+- PITCH:
+  - Evento cuando: |pitch - neutral| >= 20 grados.
+- ROLL:
+  - Evento cuando: |roll - neutral| >= 28 grados.
+- YAW:
+  - Evento cuando: |yaw - neutral| >= 35 grados.
+- HEAD_DROP_VELOCITY:
+  - Evento cuando: velocidad >= 18 grados/s.
+- HEAD_RECOVERY:
+  - Se mide cuando pitch_delta sube a >= 20 y luego baja a <= 12.
+  - Evento cuando: tiempo de recuperacion >= 1.8 s.
+- HEAD_MICRO_OSC:
+  - Ventana espectral: 6 s, banda 2.5 a 3.5 Hz.
+  - Evento cuando: valor >= 0.45.
+
+2.4 Facial
+- LANDMARK_STABILITY:
+  - Evento cuando: estabilidad <= 0.35.
+- MUSCLE_TONE:
+  - Evento cuando: caida de tono >= 0.2.
+- FACIAL_ASYMMETRY:
+  - Evento cuando: asimetria >= 2.0 x baseline_asimetria.
+  - Bandera de emergencia medica cuando: asimetria >= 3.0 x baseline_asimetria.
+
+2.5 Manos / contacto cara
+- EYE_RUB:
+  - Contacto dedo-ojo con distancia <= 36 px.
+  - Evento cuando: contacto en >= 4 frames consecutivos.
+- FACE_TOUCH_FREQ:
+  - Ventana: 300 s (5 min), convertido a frecuencia por minuto.
+  - Evento cuando: >= 5 toques/min.
+- FACE_TOUCH_DUR:
+  - Evento cuando: duracion del contacto >= 1200 ms.
+
+2.6 Contexto
+- TIME_ON_TASK:
+  - Evento cuando: tiempo en tarea >= 120 min.
+- MONOTONY:
+  - Monotonia sube por minutos sin eventos relevantes.
+  - Evento cuando: monotonia >= 3 min.
+- ILLUMINATION:
+  - Evento cuando: iluminacion < 0.2 (escala 0 a 1).
+- CIRCADIAN:
+  - Franja de mayor riesgo: 02:00-06:00 y 13:00-15:00.
+
+3) REGLAS COMPUESTAS (RULE ENGINE)
+- Evaluacion cada 1 segundo.
+- Ventanas usadas: 5 min, 30 min, 60 min.
+- Condicion de que si el ID del evento no cambia, entonces la regla se puede extender a mas de 60 minutos. (Conduccion Ininterrumpida)
+- Si son emergencias criticas, entonces se debe notificar automaticamente al supervisor que administra el sistema
+
+Reglas:
+- EAR_2S_RULE (ventana 5 min):
+  - Si existe BLINK_TC >= 2000 ms con evento, fuerza nivel minimo 4.
+- PERCLOS_TC_CROSS (ventana 30 min):
+  - Si BLINK_TC (eventos) >= 6 y PERCLOS (eventos) >= 4, fuerza nivel minimo 3.
+- HEAD_NOD_CLUSTER (ventana 5 min):
+  - Si PITCH (eventos) >= 3 o HEAD_DROP_VELOCITY (eventos) >= 3, fuerza nivel minimo 2.
+- YAWN_OR_BLINK_CLUSTER (ventana 30 min):
+  - Si BLINK_FB (eventos) >= 6, fuerza nivel minimo 1.
+- LONG_TASK_MONOTONY (ventana 60 min):
+  - Si MONOTONY (eventos) >= 5 y TIME_ON_TASK (eventos) >= 5, fuerza nivel minimo 2.
+
+4) NIVEL DE ALERTA POR PUNTAJE DE FATIGA
+- Nivel 0: score < 20 (NORMAL)
+- Nivel 1: score 20-39 (FATIGA)
+- Nivel 2: score 40-59 (SOMNOLENCIA)
+- Nivel 3: score 60-79 (CRITICO)
+- Nivel 4: score >= 80 (EMERGENCIA)
+
+5) RESUMEN PRACTICO DE "QUE SE DEBE CUMPLIR"
+Para declarar somnolencia de forma consistente, el sistema requiere:
+- Haber pasado calibracion inicial (5 min), y
+- Superar umbrales de ojos/cabeza/boca por tiempo o repeticion, y/o
+- Activar reglas compuestas en ventanas de 5/30/60 min, y/o
+- Acumular puntaje de fatiga suficiente para nivel 2 o superior.
+
+Notas:
+- Aunque el nivel 2 se etiqueta como "SOMNOLENCIA", niveles forzados por reglas pueden elevar la alerta antes de llegar a ese score.
+- Emergencia medica se evalua en paralelo con criterios propios (no depende solo del score).

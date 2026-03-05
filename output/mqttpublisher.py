@@ -21,14 +21,34 @@ class MqttPublisher(threading.Thread):
         super().__init__(daemon=True)
         self.config = config
         self.queue: "queue.Queue[Dict]" = queue.Queue(maxsize=1000)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._client: Optional[mqtt_client.Client] = None
         self._last_publish = 0.0
         self._level = 0
         self._latest_telemetry: Dict = {}
+        self._missing_host_warned = False
+
+    def _on_connect(self, _client, _userdata, _flags, rc) -> None:
+        if rc == 0:
+            topic = self.config.mqtt_topic.format(vehicle_id=self.config.vehicle_id)
+            print(f"[MQTT] Conectado a {self.config.mqtt_host}:{self.config.mqtt_port} | topic={topic}")
+        else:
+            print(f"[MQTT] Conexion rechazada, rc={rc}")
+
+    def _on_disconnect(self, _client, _userdata, rc) -> None:
+        if rc != 0:
+            print(f"[MQTT] Desconectado inesperadamente, rc={rc}. Reintentando...")
 
     def connect_client(self) -> None:
+        if not self.config.mqtt_host:
+            if not self._missing_host_warned:
+                print("[MQTT] EMQX_HOST vacio. Configura .env para habilitar envio MQTT.")
+                self._missing_host_warned = True
+            raise RuntimeError("missing mqtt host")
+
         client = mqtt_client.Client(client_id=self.config.mqtt_client_id, protocol=mqtt_client.MQTTv311)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
         if self.config.mqtt_username:
             client.username_pw_set(self.config.mqtt_username, self.config.mqtt_password)
         if self.config.mqtt_tls:
@@ -36,6 +56,7 @@ class MqttPublisher(threading.Thread):
                 client.tls_set(ca_certs=self.config.mqtt_ca_cert, cert_reqs=ssl.CERT_REQUIRED)
             else:
                 client.tls_set()
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
         client.connect(self.config.mqtt_host, self.config.mqtt_port, keepalive=60)
         client.loop_start()
         self._client = client
@@ -53,16 +74,22 @@ class MqttPublisher(threading.Thread):
         if not self._client:
             return
         topic = self.config.mqtt_topic.format(vehicle_id=self.config.vehicle_id)
-        self._client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=self.config.mqtt_qos)
+        result = self._client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=self.config.mqtt_qos)
+        if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
+            print(f"[MQTT] Error publicando en {topic}, rc={result.rc}")
+        else:
+            msg_kind = "emergencia" if payload.get("emergency", {}).get("active") else "telemetria"
+            ts = payload.get("ts")
+            print(f"[MQTT] Publicado ({msg_kind}) topic={topic} qos={self.config.mqtt_qos} ts={ts}")
         self._last_publish = time.time()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             if not self._client:
                 try:
                     self.connect_client()
                 except Exception:
-                    self._stop.wait(1.5)
+                    self._stop_event.wait(1.5)
                     continue
 
             try:
@@ -79,7 +106,7 @@ class MqttPublisher(threading.Thread):
                 self._publish_now(self._latest_telemetry)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=1.5)
         if self._client:
             self._client.loop_stop()

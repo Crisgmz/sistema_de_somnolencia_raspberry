@@ -14,12 +14,13 @@ class RuleEngine(threading.Thread):
         super().__init__(daemon=True)
         self.event_store = event_store
         self.interval_s = float(interval_s)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._latest: Dict = {"forced_min_level": 0, "reasons": []}
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
+        self.join(timeout=1.5)
 
     def latest(self) -> Dict:
         with self._lock:
@@ -63,12 +64,12 @@ class RuleEngine(threading.Thread):
         return {"forced_min_level": forced_level, "reasons": reasons}
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             now_ts = time.time()
             data = self._evaluate(now_ts)
             with self._lock:
                 self._latest = data
-            self._stop.wait(self.interval_s)
+            self._stop_event.wait(self.interval_s)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ class SupabaseSync(threading.Thread):
         super().__init__(daemon=True)
         self.config = config
         self.flush_interval_s = float(flush_interval_s)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.conn = sqlite3.connect(self.config.sqlite_queue_path, check_same_thread=False)
         self.conn.execute(
             "create table if not exists queue (id integer primary key autoincrement, table_name text not null, payload text not null, immediate int default 0, created_at real not null)"
@@ -58,11 +58,11 @@ class SupabaseSync(threading.Thread):
         self.conn.commit()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             self._flush_once(force_immediate=False)
-            self._stop.wait(self.flush_interval_s)
+            self._stop_event.wait(self.flush_interval_s)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=1.5)
         self.conn.close()

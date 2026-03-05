@@ -13,9 +13,18 @@ class AlertDispatcher:
         self.buzzer = buzzer
         self.mqtt = mqtt
 
-    def dispatch(self, level: int, reasons: List[str], payload: Dict, emergency: bool = False, emergency_type: str | None = None) -> None:
+    def dispatch(
+        self,
+        level: int,
+        reasons: List[str],
+        payload: Dict,
+        emergency: bool = False,
+        emergency_type: str | None = None,
+        fixed_buzzer: bool = False,
+    ) -> None:
         out_level = 4 if emergency else level
         self.buzzer.set_level(out_level)
+        self.buzzer.set_continuous(bool(fixed_buzzer) and out_level > 0)
         self.mqtt.set_level(out_level)
         enriched = dict(payload)
         enriched.setdefault("alerts", {})

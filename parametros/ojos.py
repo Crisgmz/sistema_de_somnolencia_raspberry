@@ -87,8 +87,13 @@ class OjosParametros:
         fb_per_min = float(len(self.blink_times))
         ibi_s = float(np.mean(self.ibi_hist)) if self.ibi_hist else 0.0
         fixation_s = self._update_fixation(ts, left_eye_center, right_eye_center)
+        eye_closed_ms = 0.0
+        if self.blink_active and self.blink_start_ts is not None:
+            eye_closed_ms = max(0.0, (ts - self.blink_start_ts) * 1000.0)
 
         return {
+            "EAR": build_param_output("EAR", ear, normalize_linear(max(0.0, calibration.ear_baseline - ear), 0.0, 0.20), calibration.calibrated and ear < close_thr, 2, ts=ts),
+            "EYE_CLOSED_MS": build_param_output("EYE_CLOSED_MS", eye_closed_ms, normalize_linear(eye_closed_ms, 300.0, 2000.0), calibration.calibrated and eye_closed_ms >= 500.0, 6, ts=ts),
             "PERCLOS": build_param_output("PERCLOS", perclos, normalize_linear(perclos, 0.15, 0.5), calibration.calibrated and perclos >= 0.25, 10, ts=ts),
             "BLINK_TC": build_param_output("BLINK_TC", self.last_tc_ms, normalize_linear(self.last_tc_ms, calibration.tc_baseline_ms, 700.0), calibration.calibrated and self.last_tc_ms >= 500.0, 6, ts=ts),
             "BLINK_FB": build_param_output("BLINK_FB", fb_per_min, max(normalize_linear(fb_per_min, 0.0, 6.0), normalize_linear(fb_per_min, 20.0, 35.0)), calibration.calibrated and (fb_per_min < 6.0 or fb_per_min > 28.0), 5, ts=ts),

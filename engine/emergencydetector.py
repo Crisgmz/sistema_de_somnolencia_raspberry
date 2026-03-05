@@ -4,11 +4,35 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+HEAD_DOWN_THRESHOLD_DEG = 20.0
+EYE_CLOSED_EMERGENCY_MS = 2000.0
+HEAD_DOWN_FIXED_BUZZER_S = 5.0
+
 
 def detect_emergency(metrics: Dict) -> Dict:
+    pitch_delta = float(metrics.get("pitch_delta", metrics.get("pitch", 0.0)))
+    # En este pipeline, pitch negativo representa inclinacion hacia abajo.
+    head_down = pitch_delta <= -HEAD_DOWN_THRESHOLD_DEG
+    eye_closed_ms = float(metrics.get("eye_closed_ms", metrics.get("blink_tc_ms", 0.0)))
+    head_down_s = float(metrics.get("head_down_s", 0.0))
+    fixed_buzzer = False
+
     reasons: List[str] = []
-    if float(metrics.get("blink_tc_ms", 0.0)) >= 2500.0 and float(metrics.get("pitch", 0.0)) >= 20.0:
+    if eye_closed_ms >= EYE_CLOSED_EMERGENCY_MS:
         reasons.append("LOSS_OF_CONSCIOUSNESS")
+    if head_down and head_down_s >= HEAD_DOWN_FIXED_BUZZER_S:
+        reasons.append("PROLONGED_HEAD_DOWN")
+        fixed_buzzer = True
+
+    if not head_down:
+        emergency = len(reasons) > 0
+        return {
+            "emergencyflag": emergency,
+            "emergencytype": reasons[0] if emergency else None,
+            "reasons": reasons,
+            "fixedbuzzer": fixed_buzzer,
+        }
+
     if float(metrics.get("head_micro_osc", 0.0)) >= 0.45 and float(metrics.get("landmark_stability", 1.0)) <= 0.35:
         reasons.append("CONVULSIVE_PATTERN")
     if float(metrics.get("facial_asymmetry", 0.0)) >= 0.09:
@@ -25,8 +49,9 @@ def detect_emergency(metrics: Dict) -> Dict:
         "emergencyflag": emergency,
         "emergencytype": reasons[0] if emergency else None,
         "reasons": reasons,
+        "fixedbuzzer": fixed_buzzer,
     }
 
 
 if __name__ == "__main__":
-    print(detect_emergency({"blink_tc_ms": 2800, "pitch": 24}))
+    print(detect_emergency({"blink_tc_ms": 2800, "pitch_delta": 24}))

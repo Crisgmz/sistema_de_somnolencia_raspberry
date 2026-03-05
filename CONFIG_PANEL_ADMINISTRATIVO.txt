@@ -1,0 +1,72 @@
+CONFIGURACION PANEL ADMINISTRATIVO - SOMNOALERT
+==============================================
+
+Fecha: 2026-03-05
+Proyecto: Somnolencia (Raspberry + MQTT + Supabase)
+
+
+1) DATOS MQTT (BACKEND / SUSCRIPCION DE TELEMETRIA)
+---------------------------------------------------
+EMQX_HOST=hbc0fc94.ala.us-east-1.emqxsl.com
+EMQX_PORT=8883
+EMQX_USERNAME=Cristian
+EMQX_PASSWORD=Noviembre0824@
+EMQX_TLS=true
+MQTT_TOPIC=fleet/{vehicle_id}/telemetry
+MQTT_QOS=1
+MQTT_CLIENT_ID=raspi-somnoalert-001
+MQTT_CA_CERT_PATH=
+VEHICLE_ID=truck_042
+DRIVER_ID=driver_007
+
+Topic final actual:
+fleet/truck_042/telemetry
+
+
+2) DATOS SUPABASE (PANEL ADMIN)
+-------------------------------
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=sb_publishable_xxx
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_xxx
+SUPABASE_DB_PASSWORD=
+SUPABASE_PROJECT_ID=
+SUPABASE_SCHEMA=public
+
+IMPORTANTE DE SEGURIDAD:
+- El panel web/frontend debe usar SOLO SUPABASE_ANON_KEY.
+- SUPABASE_SERVICE_ROLE_KEY es solo para backend seguro (nunca exponer en frontend).
+
+
+3) BASE DE DATOS Y TABLAS REQUERIDAS
+------------------------------------
+Archivo SQL listo:
+- supabase_setup.sql
+
+Tablas que debe tener el panel:
+- public.sessions
+- public.metrics_summary
+- public.events
+- public.emergency_alerts
+- public.telemetry_raw
+
+
+4) PARAMETROS YA CONFIGURADOS EN ESTE PROYECTO
+----------------------------------------------
+Archivo .env actualizado con:
+- MQTT_TOPIC productivo (fleet/{vehicle_id}/telemetry)
+- campos extra de Supabase para entrega administrativa
+
+Archivo .env.example actualizado con:
+- plantilla completa de MQTT + Supabase
+- campos SUPABASE_DB_PASSWORD, SUPABASE_PROJECT_ID, SUPABASE_SCHEMA
+
+
+5) CHECKLIST PARA EL PANEL ADMINISTRATIVO
+-----------------------------------------
+[ ] Cargar SUPABASE_URL y SUPABASE_ANON_KEY en el panel
+[ ] Ejecutar supabase_setup.sql en SQL Editor del proyecto
+[ ] Verificar que existen las 5 tablas en schema public
+[ ] Verificar lectura de sessions/metrics_summary/events/emergency_alerts
+[ ] Si el panel usa tiempo real MQTT, suscribirse a fleet/+/telemetry
+[ ] Confirmar ingreso de datos desde Raspberry (sesion activa + eventos)
+

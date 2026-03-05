@@ -31,7 +31,7 @@ def setup_camera(max_retries=6, retry_delay=0.8):
     for attempt in range(1, max_retries + 1):
         try:
             picam2 = Picamera2()
-            config = picam2.create_video_configuration(main={"size": (640, 480)})
+            config = picam2.create_video_configuration(main={"size": (1280, 960), "format": "BGR888"})
             picam2.configure(config)
             picam2.start()
             break

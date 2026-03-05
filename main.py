@@ -34,6 +34,7 @@ from parametros.ojos import OjosParametros
 from engine.ruleengine import RuleEngine
 from somnolencia_core import BOCA, OJO_DER, OJO_IZQ, get_ear, get_mar
 from storage.supabasesync import SupabaseSync
+from camera_setup import setup_camera
 
 
 @dataclass
@@ -46,7 +47,7 @@ class RuntimeState:
 class HandsWorker(threading.Thread):
     def __init__(self) -> None:
         super().__init__(daemon=True)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._in_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
         self._latest = None
         self._lock = threading.Lock()
@@ -69,7 +70,7 @@ class HandsWorker(threading.Thread):
             return self._latest
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 rgb = self._in_queue.get(timeout=0.2)
             except queue.Empty:
@@ -79,12 +80,19 @@ class HandsWorker(threading.Thread):
                 self._latest = out
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=1.0)
         self.hands.close()
 
 
 class SomnolenciaSystem:
+    WINDOW_NAME = "Somnolencia Main"
+    CAPTURE_WIDTH = 1280
+    CAPTURE_HEIGHT = 960
+    MP_PROC_WIDTH = 640
+    MP_PROC_HEIGHT = 480
+    HANDS_EVERY_N_FRAMES = 2
+
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
         self.calibration = Calibration()
@@ -109,8 +117,124 @@ class SomnolenciaSystem:
             static_image_mode=False,
             max_num_faces=1,
             refine_landmarks=False,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.exit_requested = False
+        self._exit_button_rect = (0, 0, 0, 0)
+
+    def _handle_mouse(self, event, x, y, _flags, _userdata) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        x1, y1, x2, y2 = self._exit_button_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            self.exit_requested = True
+
+    def _draw_exit_button(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+        margin = 12
+        button_w = 110
+        button_h = 38
+        x1 = max(margin, w - button_w - margin)
+        y1 = margin
+        x2 = x1 + button_w
+        y2 = y1 + button_h
+        self._exit_button_rect = (x1, y1, x2, y2)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (20, 20, 220), -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+        cv2.putText(frame, "SALIR", (x1 + 24, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+    @staticmethod
+    def _draw_parameters_panel(frame: np.ndarray, params: list[dict]) -> None:
+        if not params:
+            return
+
+        h, w = frame.shape[:2]
+        x1 = 12
+        y1 = 44
+        panel_w = min(520, max(320, w - 24))
+        line_h = 18
+        max_lines = max(6, int((h - y1 - 12) / line_h) - 1)
+
+        params_sorted = sorted(params, key=lambda p: p.get("paramid", ""))
+        visible = params_sorted[:max_lines]
+        panel_h = (len(visible) + 1) * line_h + 10
+        x2 = x1 + panel_w
+        y2 = min(h - 8, y1 + panel_h)
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0.0, frame)
+
+        cv2.putText(frame, "PARAMETROS", (x1 + 8, y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        y = y1 + 34
+        for p in visible:
+            pid = str(p.get("paramid", "-"))
+            value = float(p.get("value", 0.0))
+            normalized = float(p.get("normalized", 0.0))
+            event = "SI" if bool(p.get("eventflag", False)) else "NO"
+            color = (0, 0, 255) if event == "SI" else (255, 255, 255)
+            text = f"{pid:18s} v={value:7.3f} n={normalized:5.2f} ev={event}"
+            cv2.putText(frame, text, (x1 + 8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, color, 1)
+            y += line_h
+
+        hidden = len(params_sorted) - len(visible)
+        if hidden > 0 and y + 4 < y2:
+            cv2.putText(frame, f"... y {hidden} mas", (x1 + 8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (200, 200, 200), 1)
+
+    @staticmethod
+    def _try_open_camera(index: int) -> cv2.VideoCapture | None:
+        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, SomnolenciaSystem.CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SomnolenciaSystem.CAPTURE_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for _ in range(10):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap
+            time.sleep(0.05)
+        cap.release()
+        return None
+
+    @staticmethod
+    def _read_opencv_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None]:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return False, None
+        return True, frame
+
+    @staticmethod
+    def _read_picamera_frame(picam2) -> tuple[bool, np.ndarray | None]:
+        try:
+            frame_raw = picam2.capture_array()
+        except Exception:
+            return False, None
+        if frame_raw is None:
+            return False, None
+        # Sin conversion/manipulacion de color:
+        # Si llega en 4 canales (por ejemplo XBGR/RGBA), no se transforma aqui.
+        # if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
+        #     return True, np.ascontiguousarray(frame_raw[:, :, :3])
+        if frame_raw.ndim == 3 and frame_raw.shape[2] == 3:
+            return True, np.ascontiguousarray(frame_raw)
+        return False, None
+
+    @staticmethod
+    def _build_mediapipe_frame(frame: np.ndarray) -> np.ndarray:
+        # Optimiza costo de inferencia sin recortar: solo escala manteniendo 16:9.
+        if frame.shape[1] == SomnolenciaSystem.MP_PROC_WIDTH and frame.shape[0] == SomnolenciaSystem.MP_PROC_HEIGHT:
+            return frame
+        return cv2.resize(
+            frame,
+            (SomnolenciaSystem.MP_PROC_WIDTH, SomnolenciaSystem.MP_PROC_HEIGHT),
+            interpolation=cv2.INTER_LINEAR,
         )
 
     def start_threads(self) -> None:
@@ -128,29 +252,74 @@ class SomnolenciaSystem:
         self.face_mesh.close()
 
     def run(self) -> None:
-        cap = cv2.VideoCapture(self.cfg.camera_index)
-        if not cap.isOpened():
-            raise RuntimeError("No se pudo abrir la camara.")
+        preferred = int(self.cfg.camera_index)
+        print(f"[INFO] Abriendo camara (index preferido={preferred})...")
+        camera_kind = ""
+        camera = None
+        read_frame = None
+
+        try:
+            picam2 = setup_camera()
+            camera_kind = "picamera2"
+            camera = picam2
+            read_frame = self._read_picamera_frame
+            print("[INFO] Camara abierta con Picamera2.")
+        except Exception as exc:
+            print(f"[WARN] Picamera2 no disponible: {exc}")
+            candidates = [preferred] + [i for i in range(5) if i != preferred]
+            for idx in candidates:
+                probe = self._try_open_camera(idx)
+                if probe is not None:
+                    camera_kind = "opencv"
+                    camera = probe
+                    read_frame = self._read_opencv_frame
+                    print(f"[INFO] Camara abierta con OpenCV en index={idx}.")
+                    break
+            if camera is None:
+                raise RuntimeError(
+                    "No se pudo abrir ninguna camara. "
+                    "Verifica /dev/video*, permisos de grupo video y CAMERA_INDEX en .env."
+                )
+        print("[INFO] Esperando primer frame...")
 
         state = RuntimeState(session_id=f"ses_{uuid.uuid4().hex[:12]}", started_at=time.time(), last_minute_flush=time.time())
         self.start_threads()
 
         last_fps_ts = time.time()
+        last_health_log_ts = time.time()
         fps_count = 0
         fps = 0.0
+        first_frame_ok = False
+        first_frame_deadline = time.time() + 10.0
+        head_down_start_ts: float | None = None
+        frame_idx = 0
 
         try:
+            cv2.namedWindow(self.WINDOW_NAME)
+            cv2.setMouseCallback(self.WINDOW_NAME, self._handle_mouse)
             while True:
-                ok, frame = cap.read()
+                ok, frame = read_frame(camera)
                 if not ok or frame is None:
+                    if time.time() >= first_frame_deadline and not first_frame_ok:
+                        raise RuntimeError(
+                            "La camara se abrio, pero no entrega frames en 10s. "
+                            "Revisa CAMERA_INDEX, permisos de video y que ningun otro proceso use la camara."
+                        )
                     time.sleep(0.05)
                     continue
+                if not first_frame_ok:
+                    first_frame_ok = True
+                    print("[INFO] Primer frame recibido. Pipeline en ejecucion.")
 
                 ts = time.time()
-                h, w = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_out = self.face_mesh.process(rgb)
-                self.hands_worker.submit(rgb)
+                frame_idx += 1
+                # Pantalla: frame original completo. MediaPipe: frame optimizado (sin recorte).
+                display_frame = frame
+                mp_frame = self._build_mediapipe_frame(display_frame)
+                h, w = display_frame.shape[:2]
+                face_out = self.face_mesh.process(mp_frame)
+                if frame_idx % max(1, self.HANDS_EVERY_N_FRAMES) == 0:
+                    self.hands_worker.submit(mp_frame)
                 hand_out = self.hands_worker.latest()
 
                 param_outputs = []
@@ -191,7 +360,7 @@ class SomnolenciaSystem:
                     param_outputs.extend(list(out_manos.values()))
 
                 has_event = any(p.get("eventflag", False) for p in param_outputs)
-                out_contexto = self.contexto.update(ts, frame, has_event, self.calibration)
+                out_contexto = self.contexto.update(ts, display_frame, has_event, self.calibration)
                 param_outputs.extend(list(out_contexto.values()))
 
                 if not self.calibration.calibrated:
@@ -214,10 +383,21 @@ class SomnolenciaSystem:
                     forced_reasons=rules.get("reasons", []),
                 )
 
+                pitch_delta = pitch - self.calibration.pitch_neutral
+                head_down_now = face_detected and (pitch_delta <= -20.0)
+                if head_down_now:
+                    if head_down_start_ts is None:
+                        head_down_start_ts = ts
+                    head_down_s = max(0.0, ts - head_down_start_ts)
+                else:
+                    head_down_start_ts = None
+                    head_down_s = 0.0
                 emergency = detect_emergency(
                     {
                         "blink_tc_ms": next((p["value"] for p in param_outputs if p["paramid"] == "BLINK_TC"), 0.0),
+                        "eye_closed_ms": next((p["value"] for p in param_outputs if p["paramid"] == "EYE_CLOSED_MS"), 0.0),
                         "pitch": pitch,
+                        "pitch_delta": pitch_delta,
                         "roll": roll,
                         "yaw": yaw,
                         "head_micro_osc": next((p["value"] for p in param_outputs if p["paramid"] == "HEAD_MICRO_OSC"), 0.0),
@@ -227,6 +407,7 @@ class SomnolenciaSystem:
                         "blink_fb": next((p["value"] for p in param_outputs if p["paramid"] == "BLINK_FB"), 0.0),
                         "face_out": not face_detected,
                         "yaw_justified": abs(yaw) >= 30.0,
+                        "head_down_s": head_down_s,
                     }
                 )
 
@@ -235,6 +416,9 @@ class SomnolenciaSystem:
                     fps = fps_count / max(1e-3, time.time() - last_fps_ts)
                     fps_count = 0
                     last_fps_ts = time.time()
+                if time.time() - last_health_log_ts >= 10.0:
+                    print(f"[INFO] Sistema activo | FPS={fps:.1f} | nivel={score_out['level']} | score={score_out['fatigue_score']}")
+                    last_health_log_ts = time.time()
 
                 telemetry = {
                     "v": self.cfg.vehicle_id,
@@ -253,16 +437,25 @@ class SomnolenciaSystem:
                     payload=telemetry,
                     emergency=bool(emergency["emergencyflag"]),
                     emergency_type=emergency.get("emergencytype"),
+                    fixed_buzzer=bool(emergency.get("fixedbuzzer", False)),
                 )
 
-                cv2.putText(frame, f"FPS:{fps:.1f} SCORE:{score_out['fatigue_score']} LV:{score_out['level']}", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-                cv2.imshow("Somnolencia Main", frame)
+                cv2.putText(display_frame, f"FPS:{fps:.1f} SCORE:{score_out['fatigue_score']} LV:{score_out['level']}", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                self._draw_parameters_panel(display_frame, param_outputs)
+                self._draw_exit_button(display_frame)
+                cv2.imshow(self.WINDOW_NAME, display_frame)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
+                if key == ord("q") or key == 27 or self.exit_requested:
                     break
 
         finally:
-            cap.release()
+            if camera_kind == "opencv" and camera is not None:
+                camera.release()
+            elif camera_kind == "picamera2" and camera is not None:
+                try:
+                    camera.stop()
+                except Exception:
+                    pass
             cv2.destroyAllWindows()
             self.stop()
 
