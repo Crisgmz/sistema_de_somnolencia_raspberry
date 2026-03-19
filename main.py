@@ -5,6 +5,7 @@ Estructura simplificada por tipo de parametro dentro de carpeta `parametros/`.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -87,11 +88,11 @@ class HandsWorker(threading.Thread):
 
 class SomnolenciaSystem:
     WINDOW_NAME = "Somnolencia Main"
-    CAPTURE_WIDTH = 1280
-    CAPTURE_HEIGHT = 960
-    MP_PROC_WIDTH = 640
-    MP_PROC_HEIGHT = 480
-    HANDS_EVERY_N_FRAMES = 2
+    CAPTURE_WIDTH = 960
+    CAPTURE_HEIGHT = 720
+    MP_PROC_WIDTH = 480
+    MP_PROC_HEIGHT = 360
+    HANDS_EVERY_N_FRAMES = 4
 
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
@@ -115,13 +116,20 @@ class SomnolenciaSystem:
 
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            model_complexity=0,
             refine_landmarks=False,
+            max_num_faces=1,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
         self.exit_requested = False
         self._exit_button_rect = (0, 0, 0, 0)
+        self.display_enabled = os.getenv("SOMNO_DISPLAY_ENABLED", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
     def _handle_mouse(self, event, x, y, _flags, _userdata) -> None:
         if event != cv2.EVENT_LBUTTONDOWN:
@@ -295,8 +303,9 @@ class SomnolenciaSystem:
         frame_idx = 0
 
         try:
-            cv2.namedWindow(self.WINDOW_NAME)
-            cv2.setMouseCallback(self.WINDOW_NAME, self._handle_mouse)
+            if self.display_enabled:
+                cv2.namedWindow(self.WINDOW_NAME)
+                cv2.setMouseCallback(self.WINDOW_NAME, self._handle_mouse)
             while True:
                 ok, frame = read_frame(camera)
                 if not ok or frame is None:
@@ -440,11 +449,14 @@ class SomnolenciaSystem:
                     fixed_buzzer=bool(emergency.get("fixedbuzzer", False)),
                 )
 
-                cv2.putText(display_frame, f"FPS:{fps:.1f} SCORE:{score_out['fatigue_score']} LV:{score_out['level']}", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-                self._draw_parameters_panel(display_frame, param_outputs)
-                self._draw_exit_button(display_frame)
-                cv2.imshow(self.WINDOW_NAME, display_frame)
-                key = cv2.waitKey(1) & 0xFF
+                if self.display_enabled:
+                    cv2.putText(display_frame, f"FPS:{fps:.1f} SCORE:{score_out['fatigue_score']} LV:{score_out['level']}", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                    self._draw_parameters_panel(display_frame, param_outputs)
+                    self._draw_exit_button(display_frame)
+                    cv2.imshow(self.WINDOW_NAME, display_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                else:
+                    key = -1
                 if key == ord("q") or key == 27 or self.exit_requested:
                     break
 
@@ -456,7 +468,8 @@ class SomnolenciaSystem:
                     camera.stop()
                 except Exception:
                     pass
-            cv2.destroyAllWindows()
+            if self.display_enabled:
+                cv2.destroyAllWindows()
             self.stop()
 
 

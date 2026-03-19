@@ -1,0 +1,374 @@
+================================================================================
+PROMPT DE CALIBRACIÓN COMPLETA — SISTEMA DE DETECCIÓN DE SOMNOLENCIA
+Basado en conversación de ingeniería + criterios OEM (VW Fatigue Detection)
+================================================================================
+
+Eres un ingeniero senior de sistemas de seguridad activa embebida con experiencia
+en detección de somnolencia para vehículos. Tienes acceso al archivo
+`somnolencia_params.py` que define el dataclass `SomnolenciaParams` y la función
+`load_somnolencia_params()`.
+
+Tu tarea es aplicar las siguientes correcciones y extensiones al sistema, en orden
+de prioridad. Para cada cambio, explica brevemente la razón técnica antes de
+escribir el código.
+
+================================================================================
+BLOQUE 1 — CORRECCIONES DE FALSOS POSITIVOS (PRIORIDAD ALTA)
+================================================================================
+
+PROBLEMA 1.1 — El buzzer pita al girar la cabeza para mirar espejos
+----------------------------------------------------------------------
+El sistema dispara alarma con giros voluntarios normales de cabeza (40–90 dps)
+porque el umbral actual de 18 dps es demasiado bajo. Un cabeceo de somnolencia
+es lento (5–25 dps) y se sostiene > 2.5 s sin recuperación. Un giro a los espejos
+dura 0.5–1.5 s y el conductor vuelve solo a la posición central.
+
+Cambios requeridos en SomnolenciaParams:
+
+    head_drop_velocity_threshold_dps: float = 35.0   # antes: 18.0
+    emg_lateral_sustain_seconds: float = 2.5          # antes: 1.8
+    emg_lateral_roll_threshold: float = 50.0          # antes: 45.0
+    head_recovery_start_pitch: float = 25.0           # antes: 20.0
+    head_recovery_reset_pitch: float = 18.0           # antes: 15.0
+
+Lógica adicional a implementar: si head_drop_velocity > 35 dps Y la cabeza
+vuelve a posición central en < 2.0 s, clasificar el movimiento como "giro
+voluntario" y no incrementar el score de fatiga.
+
+PROBLEMA 1.2 — La fijación visual dispara falsos positivos en conducción normal
+----------------------------------------------------------------------
+El umbral de 28 px/s se activa cuando el conductor mira una pantalla, un cartel
+o conduce en autopista recta. La fijación de somnolencia real implica mirada
+prácticamente estática (< 10 px/s) sostenida por varios segundos.
+
+Cambios requeridos en SomnolenciaParams:
+
+    fixation_motion_threshold_px_s: float = 10.0     # antes: 28.0
+    emg_absence_fixation_seconds: float = 6.0         # antes: 4.0
+    emg_absence_no_blink_seconds: float = 4.0         # antes: 8.0
+    head_micro_window_seconds: float = 10.0           # antes: 6.0
+
+
+================================================================================
+BLOQUE 2 — DETECCIÓN DE ESTADO HIPNÓTICO (TRANCE DE AUTOPISTA)
+================================================================================
+
+El estado hipnótico no lo debe disparar ninguna señal sola. Requiere la
+coincidencia de tres señales simultáneas durante una ventana de tiempo sostenida:
+
+    Señal A — Fijación visual: fixation_motion_threshold_px_s < 10.0 px/s
+    Señal B — Parpadeo escaso: sin parpadeo detectado en > 4.0 s
+    Señal C — Cabeza inmóvil: head_drop_velocity < 8.0 dps durante > 8.0 s
+
+Implementar función de detección de estado hipnótico:
+
+    def detectar_estado_hipnotico(
+        motion_px_s: float,
+        segundos_sin_parpadeo: float,
+        head_velocity_dps: float,
+        segundos_cabeza_inmovil: float,
+        params: SomnolenciaParams
+    ) -> bool:
+        senal_a = motion_px_s < params.fixation_motion_threshold_px_s
+        senal_b = segundos_sin_parpadeo > params.emg_absence_no_blink_seconds
+        senal_c = (head_velocity_dps < 8.0 and
+                   segundos_cabeza_inmovil > params.head_micro_window_seconds)
+        return senal_a and senal_b and senal_c
+
+Nuevos parámetros a añadir al dataclass para este bloque:
+
+    hypnotic_fixation_threshold_px_s: float = 10.0
+    hypnotic_no_blink_seconds: float = 4.0
+    hypnotic_head_velocity_max_dps: float = 8.0
+    hypnotic_head_still_seconds: float = 8.0
+
+
+================================================================================
+BLOQUE 3 — SENSIBILIZACIÓN POR TIEMPO DE VIAJE (ONSET A 2.5 HORAS)
+================================================================================
+
+El sistema actual no tiene memoria de sesión. Todos los umbrales son estáticos
+desde el arranque. Un conductor lleva estadísticamente 2.5 horas de viaje
+ininterrumpido cuando entra en zona de riesgo significativo.
+
+Nuevos parámetros a añadir al dataclass:
+
+    trip_onset_seconds: float = 9000.0              # 2.5 horas = 9000 s
+    trip_sensitization_ear_factor: float = 1.10     # EAR umbral +10%
+    trip_sensitization_fixation_factor: float = 0.6 # fixation umbral ×0.6
+    trip_sensitization_blink_factor: float = 0.6    # no_blink_seconds ×0.6
+    trip_rest_reset_seconds: float = 1200.0         # parada de 20 min resetea
+
+Implementar clase de sesión de viaje:
+
+    class SesionViaje:
+        def __init__(self):
+            self.inicio_viaje: float = time.time()
+            self.ultima_parada: float = time.time()
+            self.en_parada: bool = False
+
+        def tiempo_acumulado(self) -> float:
+            return time.time() - self.inicio_viaje
+
+        def registrar_parada(self, duracion_s: float, params: SomnolenciaParams):
+            if duracion_s >= params.trip_rest_reset_seconds:
+                self.inicio_viaje = time.time()  # reset completo
+
+        def factores_activos(self, params: SomnolenciaParams) -> dict:
+            if self.tiempo_acumulado() < params.trip_onset_seconds:
+                return {"ear": 1.0, "fixation": 1.0, "blink": 1.0}
+            return {
+                "ear": params.trip_sensitization_ear_factor,
+                "fixation": params.trip_sensitization_fixation_factor,
+                "blink": params.trip_sensitization_blink_factor,
+            }
+
+Uso en el detector principal:
+
+    factores = sesion.factores_activos(params)
+    ear_threshold_efectivo = params.ear_threshold * factores["ear"]
+    fixation_efectivo = params.fixation_motion_threshold_px_s * factores["fixation"]
+    no_blink_efectivo = params.emg_absence_no_blink_seconds * factores["blink"]
+
+
+================================================================================
+BLOQUE 4 — SCORE CONTINUO DE FATIGA (ARQUITECTURA OEM)
+================================================================================
+
+En lugar de umbrales binarios independientes, implementar un score continuo
+0–100 que agrega todas las señales con pesos relativos y se actualiza cada
+500 ms. La alarma se dispara cuando el score supera un umbral, no cuando una
+señal individual lo hace.
+
+Nuevos parámetros a añadir al dataclass:
+
+    fatigue_score_alarm_threshold: float = 75.0     # score para activar buzzer
+    fatigue_score_warning_threshold: float = 60.0   # score para aviso visual
+    fatigue_score_decay_rate: float = 0.02           # decaimiento por segundo
+    fatigue_weight_ear: float = 0.25                 # peso de EAR/PERCLOS
+    fatigue_weight_blink: float = 0.20               # peso de frecuencia parpadeo
+    fatigue_weight_fixation: float = 0.15            # peso de fijación visual
+    fatigue_weight_head: float = 0.20                # peso de posición cabeza
+    fatigue_weight_yawn: float = 0.10                # peso de bostezos (MAR)
+    fatigue_weight_session: float = 0.10             # peso de tiempo de viaje
+
+Implementar motor de score:
+
+    class FatigueScoreEngine:
+        def __init__(self, params: SomnolenciaParams):
+            self.score: float = 0.0
+            self.params = params
+            self.ultimo_update: float = time.time()
+
+        def actualizar(
+            self,
+            contribucion_ear: float,       # 0.0 a 1.0
+            contribucion_blink: float,
+            contribucion_fixation: float,
+            contribucion_head: float,
+            contribucion_yawn: float,
+            contribucion_session: float,
+        ) -> float:
+            p = self.params
+            score_nuevo = (
+                contribucion_ear       * p.fatigue_weight_ear      * 100 +
+                contribucion_blink     * p.fatigue_weight_blink     * 100 +
+                contribucion_fixation  * p.fatigue_weight_fixation  * 100 +
+                contribucion_head      * p.fatigue_weight_head       * 100 +
+                contribucion_yawn      * p.fatigue_weight_yawn       * 100 +
+                contribucion_session   * p.fatigue_weight_session    * 100
+            )
+            dt = time.time() - self.ultimo_update
+            self.score = max(0.0, self.score - p.fatigue_score_decay_rate * dt * 100)
+            self.score = min(100.0, self.score + score_nuevo * dt * 2)
+            self.ultimo_update = time.time()
+            return self.score
+
+        def nivel_alerta(self) -> int:
+            if self.score >= 90:   return 4  # frenada / intervención
+            if self.score >= 75:   return 3  # buzzer + vibración
+            if self.score >= 60:   return 2  # chime + mensaje
+            if self.score >= 45:   return 1  # icono en panel
+            return 0
+
+
+================================================================================
+BLOQUE 5 — CONTEXTO CIRCADIANO Y DE CARRETERA
+================================================================================
+
+La biología del sueño tiene ventanas de riesgo conocidas. El sistema debe
+aumentar su sensibilidad automáticamente en esas franjas horarias y en
+condiciones de carretera de alta monotonía.
+
+Nuevos parámetros a añadir al dataclass:
+
+    circadian_risk_hour_start: int = 2               # 2:00 AM
+    circadian_risk_hour_end: int = 6                 # 6:00 AM
+    circadian_postlunch_start: int = 13              # 1:00 PM
+    circadian_postlunch_end: int = 15                # 3:00 PM
+    circadian_sensitivity_boost: float = 0.25        # +25% sensibilidad
+    highway_monotony_multiplier: float = 1.4         # autopista: ×1.4
+    urban_monotony_multiplier: float = 0.7           # ciudad: ×0.7
+    speed_highway_threshold_kmh: float = 90.0        # > 90 km/h = autopista
+
+Implementar ajuste circadiano:
+
+    import datetime
+
+    def multiplicador_circadiano(params: SomnolenciaParams) -> float:
+        hora = datetime.datetime.now().hour
+        en_riesgo_nocturno = (
+            params.circadian_risk_hour_start <= hora < params.circadian_risk_hour_end
+        )
+        en_riesgo_postalmuerzo = (
+            params.circadian_postlunch_start <= hora < params.circadian_postlunch_end
+        )
+        if en_riesgo_nocturno or en_riesgo_postalmuerzo:
+            return 1.0 + params.circadian_sensitivity_boost
+        return 1.0
+
+    def multiplicador_carretera(velocidad_kmh: float, params: SomnolenciaParams) -> float:
+        if velocidad_kmh >= params.speed_highway_threshold_kmh:
+            return params.highway_monotony_multiplier
+        return params.urban_monotony_multiplier
+
+
+================================================================================
+BLOQUE 6 — RESPUESTA ESCALONADA (REEMPLAZA BUZZER ÚNICO)
+================================================================================
+
+En lugar de una sola respuesta (buzzer on/off), implementar respuesta en 4 niveles
+proporcional al score de fatiga.
+
+Nuevos parámetros a añadir al dataclass:
+
+    alert_level1_score: float = 45.0    # solo icono / LED suave
+    alert_level2_score: float = 60.0    # chime simple (1 pitido corto)
+    alert_level3_score: float = 75.0    # buzzer repetitivo (comportamiento actual)
+    alert_level4_score: float = 90.0    # buzzer agresivo + vibración asiento
+    alert_level2_beep_on: float = 0.15  # pitido corto para nivel 2
+    alert_level2_beep_off: float = 1.5  # pausa larga entre pitidos nivel 2
+    alert_level3_beep_on: float = 0.35  # pitido medio para nivel 3 (actual)
+    alert_level3_beep_off: float = 0.35 # pausa media nivel 3 (actual)
+    alert_level4_beep_on: float = 0.2   # pitido corto y agresivo nivel 4
+    alert_level4_beep_off: float = 0.1  # pausa mínima nivel 4
+
+Implementar dispatcher de alertas:
+
+    def ejecutar_nivel_alerta(nivel: int, params: SomnolenciaParams, buzzer):
+        if nivel == 0:
+            buzzer.stop()
+        elif nivel == 1:
+            # Solo señal visual/LED — no activar buzzer
+            pass
+        elif nivel == 2:
+            buzzer.beep(
+                on_time=params.alert_level2_beep_on,
+                off_time=params.alert_level2_beep_off,
+                n=1
+            )
+        elif nivel == 3:
+            buzzer.beep(
+                on_time=params.alert_level3_beep_on,
+                off_time=params.alert_level3_beep_off,
+                n=None  # continuo
+            )
+        elif nivel >= 4:
+            buzzer.beep(
+                on_time=params.alert_level4_beep_on,
+                off_time=params.alert_level4_beep_off,
+                n=None  # continuo agresivo
+            )
+
+
+================================================================================
+BLOQUE 7 — DATACLASS COMPLETO ACTUALIZADO
+================================================================================
+
+Genera el archivo `somnolencia_params.py` completo con TODOS los parámetros
+originales más los nuevos de los bloques 1–6. Mantén el orden: primero los
+parámetros originales (con sus valores corregidos), luego los nuevos agrupados
+por bloque con comentarios de sección. Mantén la función load_somnolencia_params()
+existente y extiéndela para leer desde archivo los nuevos parámetros que sean
+relevantes (trip_onset_seconds, fatigue_score_alarm_threshold,
+circadian_sensitivity_boost, speed_highway_threshold_kmh).
+
+
+================================================================================
+RESUMEN DE VALORES CORREGIDOS — REFERENCIA RÁPIDA
+================================================================================
+
+PARÁMETRO                              ANTES       DESPUÉS     MOTIVO
+----------------------------------------------------------------------
+head_drop_velocity_threshold_dps       18.0        35.0        giros voluntarios
+emg_lateral_sustain_seconds            1.8         2.5         giros voluntarios
+emg_lateral_roll_threshold             45.0        50.0        margen lateral
+head_recovery_start_pitch              20.0        25.0        umbral caída
+head_recovery_reset_pitch              15.0        18.0        reset proporcional
+fixation_motion_threshold_px_s         28.0        10.0        mirada real vs normal
+emg_absence_fixation_seconds           4.0         6.0         fijación sostenida
+emg_absence_no_blink_seconds           8.0         4.0         parpadeo escaso
+head_micro_window_seconds              6.0         10.0        ventana cabeza
+perclos_window_seconds                 60.0        120.0       acumula cierre ocular
+context_monotony_window_seconds        60.0        300.0       ventana de monotonía
+----------------------------------------------------------------------
+
+NUEVOS PARÁMETROS AÑADIDOS             VALOR       BLOQUE
+----------------------------------------------------------------------
+trip_onset_seconds                     9000.0      3
+trip_sensitization_ear_factor          1.10        3
+trip_sensitization_fixation_factor     0.6         3
+trip_sensitization_blink_factor        0.6         3
+trip_rest_reset_seconds                1200.0      3
+hypnotic_fixation_threshold_px_s       10.0        2
+hypnotic_no_blink_seconds              4.0         2
+hypnotic_head_velocity_max_dps         8.0         2
+hypnotic_head_still_seconds            8.0         2
+fatigue_score_alarm_threshold          75.0        4
+fatigue_score_warning_threshold        60.0        4
+fatigue_score_decay_rate               0.02        4
+fatigue_weight_ear                     0.25        4
+fatigue_weight_blink                   0.20        4
+fatigue_weight_fixation                0.15        4
+fatigue_weight_head                    0.20        4
+fatigue_weight_yawn                    0.10        4
+fatigue_weight_session                 0.10        4
+circadian_risk_hour_start              2           5
+circadian_risk_hour_end                6           5
+circadian_postlunch_start              13          5
+circadian_postlunch_end                15          5
+circadian_sensitivity_boost            0.25        5
+highway_monotony_multiplier            1.4         5
+urban_monotony_multiplier              0.7         5
+speed_highway_threshold_kmh            90.0        5
+alert_level1_score                     45.0        6
+alert_level2_score                     60.0        6
+alert_level3_score                     75.0        6
+alert_level4_score                     90.0        6
+alert_level2_beep_on                   0.15        6
+alert_level2_beep_off                  1.5         6
+alert_level3_beep_on                   0.35        6
+alert_level3_beep_off                  0.35        6
+alert_level4_beep_on                   0.2         6
+alert_level4_beep_off                  0.1         6
+----------------------------------------------------------------------
+
+================================================================================
+INSTRUCCIONES DE IMPLEMENTACIÓN
+================================================================================
+
+1. Aplica los bloques en orden (1 → 6). No saltes al bloque 4 sin el 1 y 2.
+2. Después de cada bloque, prueba en carretera con al menos 30 min de conducción
+   normal antes de pasar al siguiente.
+3. El bloque 4 (score continuo) es el cambio arquitectónico más grande — requiere
+   refactorizar el loop principal del detector para alimentar el engine cada frame.
+4. Para el bloque 5 (contexto circadiano), si no tienes acceso a velocidad del
+   vehículo via CAN/GPS, usa como proxy la frecuencia de correcciones de cabeza:
+   poca corrección = autopista, mucha corrección = ciudad.
+5. Registra logs con timestamp de cada señal y el score resultante durante las
+   primeras sesiones para validar que los pesos del bloque 4 son correctos para
+   tu hardware específico (cámara, FPS, iluminación).
+
+================================================================================
+FIN DEL PROMPT
+================================================================================
