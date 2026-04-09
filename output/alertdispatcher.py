@@ -80,7 +80,8 @@ class AlertDispatcher:
         enriched["emergency"].update({"active": bool(emergency), "type": emergency_type})
 
         if self._should_publish_mqtt(out_level, reasons, emergency):
-            self.mqtt.enqueue({"kind": "immediate" if emergency else "telemetry", "payload": enriched})
+            immediate = bool(emergency) or out_level >= 2
+            self.mqtt.enqueue({"kind": "immediate" if immediate else "telemetry", "payload": enriched})
 
         return enriched
 

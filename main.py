@@ -133,6 +133,8 @@ class SomnolenciaSystem:
         )
         self.exit_requested = False
         self._exit_button_rect = (0, 0, 0, 0)
+        self._rotate_button_rect = (0, 0, 0, 0)
+        self.rotation_index = int(os.getenv("CAMERA_ROTATION", "0")) % 4
         self.display_enabled = os.getenv("SOMNO_DISPLAY_ENABLED", "1").strip().lower() in (
             "1",
             "true",
@@ -146,18 +148,32 @@ class SomnolenciaSystem:
         x1, y1, x2, y2 = self._exit_button_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
             self.exit_requested = True
+            return
+        x1, y1, x2, y2 = self._rotate_button_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            self.rotation_index = (self.rotation_index + 1) % 4
+            print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados")
 
     def _draw_exit_button(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
         margin = 12
         button_w = 110
         button_h = 38
+
+        rx1 = margin
+        ry1 = margin
+        rx2 = rx1 + button_w
+        ry2 = ry1 + button_h
+        self._rotate_button_rect = (rx1, ry1, rx2, ry2)
+        cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (180, 120, 20), -1)
+        cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 255, 255), 1)
+        cv2.putText(frame, f"GIRO {self.rotation_index * 90}", (rx1 + 8, ry1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+
         x1 = max(margin, w - button_w - margin)
         y1 = margin
         x2 = x1 + button_w
         y2 = y1 + button_h
         self._exit_button_rect = (x1, y1, x2, y2)
-
         cv2.rectangle(frame, (x1, y1), (x2, y2), (20, 20, 220), -1)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
         cv2.putText(frame, "SALIR", (x1 + 24, y1 + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
@@ -261,15 +277,27 @@ class SomnolenciaSystem:
         return False, None
 
     @staticmethod
+    def _apply_rotation(frame: np.ndarray, rotation_index: int) -> np.ndarray:
+        rotation_index = int(rotation_index) % 4
+        if rotation_index == 1:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if rotation_index == 2:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if rotation_index == 3:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
+    @staticmethod
     def _build_mediapipe_frame(frame: np.ndarray) -> np.ndarray:
         # Optimiza costo de inferencia sin recortar: solo escala manteniendo 16:9.
         if frame.shape[1] == SomnolenciaSystem.MP_PROC_WIDTH and frame.shape[0] == SomnolenciaSystem.MP_PROC_HEIGHT:
-            return frame
-        return cv2.resize(
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(
             frame,
             (SomnolenciaSystem.MP_PROC_WIDTH, SomnolenciaSystem.MP_PROC_HEIGHT),
             interpolation=cv2.INTER_LINEAR,
         )
+        return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
     @staticmethod
     def _iso_ts(ts: float) -> str:
@@ -553,10 +581,11 @@ class SomnolenciaSystem:
 
                 ts = time.time()
                 frame_idx += 1
-                # Pantalla: frame original completo. MediaPipe: frame optimizado (sin recorte).
-                display_frame = frame
+                # Pantalla: frame original rotado segun preferencia. MediaPipe: frame optimizado (sin recorte).
+                display_frame = self._apply_rotation(frame, self.rotation_index)
                 mp_frame = self._build_mediapipe_frame(display_frame)
                 h, w = display_frame.shape[:2]
+                mp_h, mp_w = mp_frame.shape[:2]
                 face_out = self.face_mesh.process(mp_frame)
                 if frame_idx % max(1, self.HANDS_EVERY_N_FRAMES) == 0:
                     self.hands_worker.submit(mp_frame)
@@ -571,25 +600,25 @@ class SomnolenciaSystem:
                 if face_out.multi_face_landmarks:
                     face_detected = True
                     lm = face_out.multi_face_landmarks[0].landmark
-                    ear_left = get_ear(lm, OJO_IZQ, w, h)
-                    ear_right = get_ear(lm, OJO_DER, w, h)
+                    ear_left = get_ear(lm, OJO_IZQ, mp_w, mp_h)
+                    ear_right = get_ear(lm, OJO_DER, mp_w, mp_h)
                     ear = (ear_left + ear_right) * 0.5
-                    mar = get_mar(lm, BOCA, w, h)
+                    mar = get_mar(lm, BOCA, mp_w, mp_h)
 
-                    left_pts = np.asarray([[lm[i].x * w, lm[i].y * h] for i in OJO_IZQ], dtype=np.float32)
-                    right_pts = np.asarray([[lm[i].x * w, lm[i].y * h] for i in OJO_DER], dtype=np.float32)
+                    left_pts = np.asarray([[lm[i].x * mp_w, lm[i].y * mp_h] for i in OJO_IZQ], dtype=np.float32)
+                    right_pts = np.asarray([[lm[i].x * mp_w, lm[i].y * mp_h] for i in OJO_DER], dtype=np.float32)
                     left_center = np.mean(left_pts, axis=0)
                     right_center = np.mean(right_pts, axis=0)
 
-                    out_cabeza = self.cabeza.update(ts, lm, w, h, self.calibration)
+                    out_cabeza = self.cabeza.update(ts, lm, mp_w, mp_h, self.calibration)
                     pitch = out_cabeza["PITCH"]["value"]
                     yaw = out_cabeza["YAW"]["value"]
                     roll = out_cabeza["ROLL"]["value"]
 
                     out_ojos = self.ojos.update(ts, ear, left_center, right_center, self.calibration)
                     out_boca = self.boca.update(ts, mar, self.calibration)
-                    out_facial = self.facial.update(ts, lm, w, h, self.calibration)
-                    out_manos = self.manos.update(ts, hand_out, left_center, right_center, w, h, self.calibration)
+                    out_facial = self.facial.update(ts, lm, mp_w, mp_h, self.calibration)
+                    out_manos = self.manos.update(ts, hand_out, left_center, right_center, mp_w, mp_h, self.calibration)
 
                     fixation_value = out_ojos["FIXATION"]["value"]
 
@@ -727,6 +756,9 @@ class SomnolenciaSystem:
                     key = cv2.waitKey(1) & 0xFF
                 else:
                     key = -1
+                if key == ord("r"):
+                    self.rotation_index = (self.rotation_index + 1) % 4
+                    print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados")
                 if key == ord("q") or key == 27 or self.exit_requested:
                     break
 
