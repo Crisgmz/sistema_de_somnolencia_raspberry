@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 HEAD_DOWN_THRESHOLD_DEG = 20.0
-EYE_CLOSED_EMERGENCY_MS = 2000.0
+EYE_CLOSED_EMERGENCY_MS = 1200.0
 HEAD_DOWN_FIXED_BUZZER_S = 5.0
 
 
