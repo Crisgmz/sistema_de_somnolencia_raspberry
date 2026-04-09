@@ -32,7 +32,7 @@ Real-time drowsiness detection running on Raspberry Pi 4 with camera, GPIO buzze
 
 ### MQTT
 - Broker: EMQX Cloud (TLS on port 8883)
-- Topic: `fleet/{vehicle_id}/telemetry`
+- Topic: `test/connection`
 - Publish interval: 10s (normal) down to 1s (emergency)
 - Emergency messages published immediately
 - QoS configurable (default 1)
