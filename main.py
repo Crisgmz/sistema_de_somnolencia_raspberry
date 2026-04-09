@@ -60,7 +60,6 @@ class HandsWorker(threading.Thread):
         self.hands = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            model_complexity=0,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
@@ -127,7 +126,6 @@ class SomnolenciaSystem:
 
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            model_complexity=0,
             refine_landmarks=False,
             max_num_faces=1,
             min_detection_confidence=0.5,
