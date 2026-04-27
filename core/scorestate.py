@@ -30,11 +30,13 @@ class ScoreStateStore:
 
     def load(self) -> Dict:
         with self._lock:
-            row = self.conn.execute("select payload from score_state where key = ?", (self.key,)).fetchone()
+            row = self.conn.execute("select payload, updated_at from score_state where key = ?", (self.key,)).fetchone()
         if not row:
             return {}
         try:
-            return json.loads(row[0])
+            payload = json.loads(row[0])
+            payload["_updated_at"] = float(row[1])
+            return payload
         except (TypeError, ValueError):
             return {}
 

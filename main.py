@@ -147,7 +147,7 @@ class SomnolenciaSystem:
         self.exit_requested = False
         self._exit_button_rect = (0, 0, 0, 0)
         self._rotate_button_rect = (0, 0, 0, 0)
-        self.rotation_index = int(os.getenv("CAMERA_ROTATION", "0")) % 4
+        self.rotation_index = self._parse_rotation(os.getenv("CAMERA_ROTATION", "0"))
         self.display_enabled = os.getenv("SOMNO_DISPLAY_ENABLED", "1").strip().lower() in (
             "1",
             "true",
@@ -164,8 +164,7 @@ class SomnolenciaSystem:
             return
         x1, y1, x2, y2 = self._rotate_button_rect
         if x1 <= x <= x2 and y1 <= y <= y2:
-            self.rotation_index = (self.rotation_index + 1) % 4
-            print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados")
+            self._set_rotation((self.rotation_index + 1) % 4, "manual")
 
     def _draw_exit_button(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -201,6 +200,23 @@ class SomnolenciaSystem:
         if normalized >= 0.4:
             return (0, 255, 255)  # amarillo BGR
         return (200, 200, 200)  # gris claro
+
+    @staticmethod
+    def _parse_rotation(raw_value: str) -> int:
+        try:
+            value = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            return 0
+        if value in (0, 90, 180, 270):
+            return (value // 90) % 4
+        return value % 4
+
+    def _set_rotation(self, rotation_index: int, source: str) -> None:
+        rotation_index = int(rotation_index) % 4
+        if rotation_index == self.rotation_index:
+            return
+        self.rotation_index = rotation_index
+        print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados ({source})")
 
     @staticmethod
     def _draw_parameters_panel(frame: np.ndarray, params: list[dict]) -> None:
@@ -705,13 +721,16 @@ class SomnolenciaSystem:
                     self.event_store.append(p)
 
                 rules = self.rule_engine.latest()
+                score_forced_min_level = rules.get("forced_min_level", 0) if face_detected else 0
+                score_forced_reasons = rules.get("reasons", []) if face_detected else []
                 score_out = self.score.update(
                     ts=ts,
-                    param_outputs=param_outputs,
+                    param_outputs=param_outputs if face_detected else [],
                     vehicle_moving=True,
                     driver_response=False,
-                    forced_min_level=rules.get("forced_min_level", 0),
-                    forced_reasons=rules.get("reasons", []),
+                    forced_min_level=score_forced_min_level,
+                    forced_reasons=score_forced_reasons,
+                    sensor_valid=face_detected,
                 )
 
                 pitch_delta = pitch - self.calibration.pitch_neutral
@@ -820,8 +839,7 @@ class SomnolenciaSystem:
                 else:
                     key = cv2.waitKey(1) & 0xFF if self.display_enabled else -1
                 if key == ord("r"):
-                    self.rotation_index = (self.rotation_index + 1) % 4
-                    print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados")
+                    self._set_rotation((self.rotation_index + 1) % 4, "manual")
                 if key == ord("q") or key == 27 or self.exit_requested:
                     break
 
