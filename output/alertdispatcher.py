@@ -16,6 +16,7 @@ from output.mqttpublisher import MqttPublisher
 class AlertDispatcher:
     # Tiempo minimo (segundos) que un nivel debe mantenerse antes de poder bajar.
     LEVEL_HOLD_S = 3.0
+    SOUND_DELAY_S = 2.0
     # Intervalo minimo entre publicaciones MQTT para el mismo nivel+reasons.
     MQTT_DEDUP_S = 2.0
 
@@ -31,13 +32,23 @@ class AlertDispatcher:
         self._suppressed_count = 0
         self._last_supervisor_ts = 0.0
         self._last_supervisor_sig: tuple = ()
+        self._emergency_active = False
+        self._sound_candidate_level = 0
+        self._sound_candidate_since_ts = 0.0
 
     def _apply_hysteresis(self, raw_level: int, emergency: bool) -> int:
         now = time.time()
         if emergency:
+            self._emergency_active = True
             self._effective_level = 4
             self._level_since_ts = now
             return 4
+
+        if self._emergency_active:
+            self._emergency_active = False
+            self._effective_level = raw_level
+            self._level_since_ts = now
+            return self._effective_level
 
         if raw_level >= self._effective_level:
             self._effective_level = raw_level
@@ -47,6 +58,24 @@ class AlertDispatcher:
             self._level_since_ts = now
 
         return self._effective_level
+
+    def _delayed_buzzer_level(self, level: int, emergency: bool) -> int:
+        level = max(0, min(4, int(level)))
+        if level <= 0:
+            self._sound_candidate_level = 0
+            self._sound_candidate_since_ts = 0.0
+            return 0
+        if emergency:
+            return level
+
+        now = time.time()
+        if level != self._sound_candidate_level:
+            self._sound_candidate_level = level
+            self._sound_candidate_since_ts = now
+            return 0
+        if (now - self._sound_candidate_since_ts) < self.SOUND_DELAY_S:
+            return 0
+        return level
 
     def _should_publish_mqtt(self, level: int, reasons: List[str], emergency: bool) -> bool:
         if emergency:
@@ -73,8 +102,9 @@ class AlertDispatcher:
         fixed_buzzer: bool = False,
     ) -> Dict:
         out_level = self._apply_hysteresis(level, emergency)
-        self.buzzer.set_level(out_level)
-        self.buzzer.set_continuous(bool(fixed_buzzer) and out_level > 0)
+        buzzer_level = self._delayed_buzzer_level(out_level, emergency)
+        self.buzzer.set_level(buzzer_level)
+        self.buzzer.set_continuous(bool(fixed_buzzer) and buzzer_level > 0)
         self.mqtt.set_level(out_level)
 
         enriched = dict(payload)
@@ -87,13 +117,14 @@ class AlertDispatcher:
             immediate = bool(emergency) or out_level >= 2
             self.mqtt.enqueue({"kind": "immediate" if immediate else "telemetry", "payload": enriched})
 
-        if self._should_notify_supervisor(out_level, emergency, reasons):
+        notify_level = 4 if emergency else int(level)
+        if self._should_notify_supervisor(notify_level, emergency, reasons):
             self.mqtt.enqueue_supervisor({
                 "vehicle_id": enriched.get("v"),
                 "driver_id": enriched.get("d"),
                 "ts": enriched.get("ts"),
                 "session_id": enriched.get("session_id"),
-                "level": out_level,
+                "level": notify_level,
                 "emergency": bool(emergency),
                 "emergency_type": emergency_type,
                 "reasons": reasons,

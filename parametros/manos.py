@@ -12,7 +12,7 @@ from core.common_types import build_param_output, normalize_linear
 
 
 class ManosParametros:
-    def __init__(self, min_eye_rub_frames: int = 4, touch_window_s: float = 300.0) -> None:
+    def __init__(self, min_eye_rub_frames: int = 6, touch_window_s: float = 300.0) -> None:
         self.min_eye_rub_frames = int(min_eye_rub_frames)
         self.touch_window_s = float(touch_window_s)
         self.eye_rub_frames = 0
@@ -64,8 +64,8 @@ class ManosParametros:
 
         return {
             "EYE_RUB": build_param_output("EYE_RUB", float(self.eye_rub_frames), 1.0 if eye_rub_event else 0.0, eye_rub_event, 4 if eye_rub_event else 0, ts=ts),
-            "FACE_TOUCH_FREQ": build_param_output("FACE_TOUCH_FREQ", touch_freq_per_min, normalize_linear(touch_freq_per_min, 2.0, 10.0), calibration.calibrated and touch_freq_per_min >= 5.0, 2, ts=ts),
-            "FACE_TOUCH_DUR": build_param_output("FACE_TOUCH_DUR", touch_dur_ms, normalize_linear(touch_dur_ms, 400.0, 2500.0), calibration.calibrated and touch_dur_ms >= 1200.0, 2, ts=ts),
+            "FACE_TOUCH_FREQ": build_param_output("FACE_TOUCH_FREQ", touch_freq_per_min, normalize_linear(touch_freq_per_min, 3.0, 12.0), calibration.calibrated and touch_freq_per_min >= 7.0, 2, ts=ts),
+            "FACE_TOUCH_DUR": build_param_output("FACE_TOUCH_DUR", touch_dur_ms, normalize_linear(touch_dur_ms, 800.0, 3000.0), calibration.calibrated and touch_dur_ms >= 2000.0, 2, ts=ts),
         }
 
 

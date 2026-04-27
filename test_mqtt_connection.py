@@ -31,7 +31,14 @@ def main() -> None:
         "sys": {"status": "mqtt_test"},
     }
 
-    client = mqtt_client.Client(client_id=f"{cfg.mqtt_client_id}-probe", protocol=mqtt_client.MQTTv311)
+    transport = "websockets" if cfg.mqtt_transport in {"websocket", "websockets", "ws", "wss"} else "tcp"
+    client = mqtt_client.Client(
+        client_id=f"{cfg.mqtt_client_id}-probe",
+        protocol=mqtt_client.MQTTv311,
+        transport=transport,
+    )
+    if transport == "websockets":
+        client.ws_set_options(path=cfg.mqtt_ws_path or "/mqtt")
     if cfg.mqtt_username:
         client.username_pw_set(cfg.mqtt_username, cfg.mqtt_password)
     if cfg.mqtt_tls:
@@ -50,7 +57,7 @@ def main() -> None:
     if not info.is_published():
         raise RuntimeError("No se pudo confirmar publicacion MQTT")
 
-    print(f"[OK] MQTT publicado en topic={topic}")
+    print(f"[OK] MQTT publicado en topic={topic} transport={transport}")
 
 
 if __name__ == "__main__":

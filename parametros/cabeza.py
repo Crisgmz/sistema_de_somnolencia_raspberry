@@ -66,7 +66,7 @@ class CabezaParametros:
         self.prev_ts = ts
 
         pitch_delta = pitch - calibration.pitch_neutral
-        if pitch_delta >= 20.0 and not self.recovery_active:
+        if pitch_delta >= 24.0 and not self.recovery_active:
             self.recovery_active = True
             self.recovery_start_ts = ts
         elif self.recovery_active and pitch_delta <= 12.0:
@@ -92,12 +92,12 @@ class CabezaParametros:
                 micro_value = float(np.sum(spec[band] ** 2) / total) if total > 1e-9 else 0.0
 
         return {
-            "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 8.0, 25.0), calibration.calibrated and abs(pitch_delta) >= 20.0, 6, ts=ts),
-            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(roll - calibration.roll_neutral), 8.0, 35.0), calibration.calibrated and abs(roll - calibration.roll_neutral) >= 28.0, 5, ts=ts),
-            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(yaw - calibration.yaw_neutral), 10.0, 40.0), calibration.calibrated and abs(yaw - calibration.yaw_neutral) >= 35.0, 3, ts=ts),
-            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 8.0, 35.0), calibration.calibrated and velocity >= 18.0, 7, ts=ts),
-            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.5, 3.0), calibration.calibrated and self.last_recovery >= 1.8, 6, ts=ts),
-            "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.2, 0.7), calibration.calibrated and micro_value >= 0.45, 0, ts=ts),
+            "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
+            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(roll - calibration.roll_neutral), 12.0, 40.0), calibration.calibrated and abs(roll - calibration.roll_neutral) >= 32.0, 4, ts=ts),
+            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(yaw - calibration.yaw_neutral), 15.0, 45.0), calibration.calibrated and abs(yaw - calibration.yaw_neutral) >= 40.0, 2, ts=ts),
+            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and velocity >= 25.0, 6, ts=ts),
+            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), calibration.calibrated and self.last_recovery >= 2.3, 5, ts=ts),
+            "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.3, 0.8), calibration.calibrated and micro_value >= 0.55, 0, ts=ts),
         }
 
 

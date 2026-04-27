@@ -27,6 +27,7 @@ from core.calibration import Calibration
 from core.config import AppConfig
 from engine.emergencydetector import detect_emergency
 from core.eventstore import EventStore
+from core.scorestate import ScoreStateStore
 from engine.fatiguescore import DynamicFatigueScore
 from output.mqttpublisher import MqttPublisher
 from parametros.boca import BocaParametros
@@ -38,7 +39,7 @@ from parametros.ojos import OjosParametros
 from engine.ruleengine import RuleEngine
 from somnolencia_core import BOCA, OJO_DER, OJO_IZQ, get_ear, get_mar
 from storage.supabasesync import SupabaseSync
-from camera_setup import setup_camera
+from camera_setup import describe_camera_environment, list_opencv_candidates, setup_camera
 
 
 @dataclass
@@ -48,6 +49,8 @@ class RuntimeState:
     last_minute_flush: float
     last_telemetry_persist: float = 0.0
     last_session_sync: float = 0.0
+    last_score_state_persist: float = 0.0
+    last_score_state_value: int = -1
 
 
 class HandsWorker(threading.Thread):
@@ -103,8 +106,16 @@ class SomnolenciaSystem:
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
         self.calibration = Calibration()
-        self.event_store = EventStore()
+        self.event_store = EventStore(config.sqlite_queue_path)
         self.score = DynamicFatigueScore()
+        self.score_state_store = ScoreStateStore(config.sqlite_queue_path, config.vehicle_id, config.driver_id)
+        saved_score_state = self.score_state_store.load()
+        if saved_score_state:
+            self.score.restore(saved_score_state)
+            print(
+                "[SCORE] Estado restaurado "
+                f"score={self.score.score} max={self.score.max_score_seen} alertas={self.score.alert_count}"
+            )
 
         self.ojos = OjosParametros()
         self.boca = BocaParametros()
@@ -236,7 +247,7 @@ class SomnolenciaSystem:
             cv2.putText(frame, f"... y {hidden} mas", (x1 + 8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1)
 
     @staticmethod
-    def _try_open_camera(index: int) -> cv2.VideoCapture | None:
+    def _try_open_camera(index: int | str) -> cv2.VideoCapture | None:
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
@@ -254,6 +265,29 @@ class SomnolenciaSystem:
             time.sleep(0.05)
         cap.release()
         return None
+
+    @staticmethod
+    def _camera_candidates(preferred: int) -> list[int | str]:
+        candidates: list[int | str] = [preferred]
+
+        for idx in range(5):
+            if idx != preferred:
+                candidates.append(idx)
+
+        for device_path in list_opencv_candidates():
+            candidates.append(device_path)
+            suffix = device_path.removeprefix("/dev/video")
+            if suffix.isdigit():
+                candidates.append(int(suffix))
+
+        unique: list[int | str] = []
+        seen: set[int | str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique.append(candidate)
+        return unique
 
     @staticmethod
     def _read_opencv_frame(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None]:
@@ -396,6 +430,19 @@ class SomnolenciaSystem:
             self._last_emergency_type = None
             self._last_emergency_started_at = None
 
+    def _persist_score_state(self, state: RuntimeState, ts: float) -> None:
+        score_value = int(self.score.score)
+        should_save = (
+            state.last_score_state_persist == 0.0
+            or score_value != state.last_score_state_value
+            or (ts - state.last_score_state_persist) >= 5.0
+        )
+        if not should_save:
+            return
+        self.score_state_store.save(self.score.snapshot(), ts=ts)
+        state.last_score_state_persist = ts
+        state.last_score_state_value = score_value
+
     def _append_minute_sample(self, ts: float, param_outputs: list[dict], score_out: dict) -> None:
         self._minute_samples.append(
             {
@@ -501,6 +548,8 @@ class SomnolenciaSystem:
         self.supabase.stop()
         self.buzzer.stop()
         self.face_mesh.close()
+        self.score_state_store.close()
+        self.event_store.close()
 
     def run(self) -> None:
         preferred = int(self.cfg.camera_index)
@@ -518,19 +567,21 @@ class SomnolenciaSystem:
             print("[INFO] Camara abierta con Picamera2.")
         except Exception as exc:
             print(f"[WARN] Picamera2 no disponible: {exc}")
-            candidates = [preferred] + [i for i in range(5) if i != preferred]
-            for idx in candidates:
-                probe = self._try_open_camera(idx)
+            candidates = self._camera_candidates(preferred)
+            print("[INFO] Candidatos OpenCV: " + ", ".join(str(candidate) for candidate in candidates))
+            for candidate in candidates:
+                probe = self._try_open_camera(candidate)
                 if probe is not None:
                     camera_kind = "opencv"
                     camera = probe
                     read_frame = self._read_opencv_frame
-                    print(f"[INFO] Camara abierta con OpenCV en index={idx}.")
+                    print(f"[INFO] Camara abierta con OpenCV en fuente={candidate}.")
                     break
             if camera is None:
                 raise RuntimeError(
                     "No se pudo abrir ninguna camara. "
-                    "Verifica /dev/video*, permisos de grupo video y CAMERA_INDEX en .env."
+                    "Verifica /dev/video*, permisos de grupo video, libcamera y CAMERA_INDEX en .env. "
+                    f"Estado detectado: {describe_camera_environment()}"
                 )
         print("[INFO] Esperando primer frame...")
 
@@ -664,7 +715,7 @@ class SomnolenciaSystem:
                 )
 
                 pitch_delta = pitch - self.calibration.pitch_neutral
-                head_down_now = face_detected and (pitch_delta <= -20.0)
+                head_down_now = face_detected and (pitch_delta <= -24.0)
                 if head_down_now:
                     if head_down_start_ts is None:
                         head_down_start_ts = ts
@@ -692,11 +743,12 @@ class SomnolenciaSystem:
                         "head_down_s": head_down_s,
                     }
                 )
-                if eye_closed_ms >= 700.0 and int(score_out.get("level", 0)) < 2:
+                if eye_closed_ms >= 1500.0 and int(score_out.get("level", 0)) < 2:
                     reasons = list(score_out.get("reasons", []))
                     if "EYE_CLOSED_MS_FAST" not in reasons:
                         reasons.append("EYE_CLOSED_MS_FAST")
                     score_out = {**score_out, "level": 2, "label": self.score.level_label(2), "reasons": reasons}
+                self._persist_score_state(state, ts)
 
                 fps_count += 1
                 if time.time() - last_fps_ts >= 1.0:
@@ -775,6 +827,7 @@ class SomnolenciaSystem:
 
         finally:
             shutdown_ts = time.time()
+            self.score_state_store.save(self.score.snapshot(), ts=shutdown_ts)
             self._flush_minute_summary(state, shutdown_ts, last_telemetry, force=True)
             self._sync_session(state, shutdown_ts, last_score_out, is_final=True)
             if camera_kind == "opencv" and camera is not None:

@@ -15,6 +15,8 @@ class AppConfig:
     mqtt_password: str = ""
     mqtt_topic: str = "test/connection"
     mqtt_supervisor_topic: str = ""  # vacio = topic principal + "/supervisor"
+    mqtt_transport: str = "tcp"
+    mqtt_ws_path: str = "/mqtt"
     mqtt_tls: bool = True
     mqtt_qos: int = 1
     mqtt_client_id: str = "raspi-somnoalert"
@@ -36,6 +38,8 @@ class AppConfig:
             mqtt_password=os.getenv("EMQX_PASSWORD", ""),
             mqtt_topic=os.getenv("MQTT_TOPIC", "test/connection"),
             mqtt_supervisor_topic=os.getenv("MQTT_SUPERVISOR_TOPIC", ""),
+            mqtt_transport=os.getenv("MQTT_TRANSPORT", "tcp").strip().lower(),
+            mqtt_ws_path=os.getenv("MQTT_WS_PATH", "/mqtt"),
             mqtt_tls=tls_raw in {"1", "true", "yes", "on"},
             mqtt_qos=int(os.getenv("MQTT_QOS", "1")),
             mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "raspi-somnoalert"),

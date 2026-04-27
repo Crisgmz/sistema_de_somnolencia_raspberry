@@ -61,7 +61,14 @@ class MqttPublisher(threading.Thread):
                 self._missing_host_warned = True
             raise RuntimeError("missing mqtt host")
 
-        client = mqtt_client.Client(client_id=self.config.mqtt_client_id, protocol=mqtt_client.MQTTv311)
+        transport = "websockets" if self.config.mqtt_transport in {"websocket", "websockets", "ws", "wss"} else "tcp"
+        client = mqtt_client.Client(
+            client_id=self.config.mqtt_client_id,
+            protocol=mqtt_client.MQTTv311,
+            transport=transport,
+        )
+        if transport == "websockets":
+            client.ws_set_options(path=self.config.mqtt_ws_path or "/mqtt")
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_publish = self._on_publish
@@ -118,6 +125,7 @@ class MqttPublisher(threading.Thread):
     def stats(self) -> Dict:
         return {
             "connected": self._connected,
+            "transport": self.config.mqtt_transport,
             "last_publish_ts": self._last_publish,
             "published_count": self._published_count,
             "delivered_count": self._delivered_count,

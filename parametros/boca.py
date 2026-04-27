@@ -16,7 +16,7 @@ class BocaParametros:
         self.yawn_count = 0
 
     def update(self, ts: float, mar: float, calibration: Calibration):
-        thr = max(0.30, calibration.mar_baseline * 1.25)
+        thr = max(0.34, calibration.mar_baseline * 1.4)
         if mar >= thr and not self.yawn_active:
             self.yawn_active = True
             self.yawn_start_ts = ts
@@ -28,9 +28,9 @@ class BocaParametros:
 
         event = calibration.calibrated and mar >= thr
         return {
-            "MAR": build_param_output("MAR", mar, normalize_linear(mar, calibration.mar_baseline, calibration.mar_baseline * 1.8), event, 5 if event else 0, ts=ts),
-            "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 1.0, 6.0), calibration.calibrated and self.yawn_count >= 3, 5, ts=ts),
-            "YAWN_DUR": build_param_output("YAWN_DUR", float(self.last_yawn_dur), normalize_linear(float(self.last_yawn_dur), 0.7, 2.5), calibration.calibrated and self.last_yawn_dur >= 1.5, 4, ts=ts),
+            "MAR": build_param_output("MAR", mar, normalize_linear(mar, calibration.mar_baseline * 1.1, calibration.mar_baseline * 2.0), event, 4 if event else 0, ts=ts),
+            "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 2.0, 7.0), calibration.calibrated and self.yawn_count >= 4, 5, ts=ts),
+            "YAWN_DUR": build_param_output("YAWN_DUR", float(self.last_yawn_dur), normalize_linear(float(self.last_yawn_dur), 1.0, 3.0), calibration.calibrated and self.last_yawn_dur >= 2.0, 4, ts=ts),
         }
 
 
