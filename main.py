@@ -95,9 +95,10 @@ class SomnolenciaSystem:
     # Reducido a 480p para mejorar latencia/deteccion en Raspberry.
     CAPTURE_WIDTH = 640
     CAPTURE_HEIGHT = 480
-    MP_PROC_WIDTH = 480
-    MP_PROC_HEIGHT = 270
+    MP_PROC_WIDTH = 320
+    MP_PROC_HEIGHT = 180
     HANDS_EVERY_N_FRAMES = 4
+    DISPLAY_INTERVAL_S = 1.0 / 15.0  # limita display a 15 fps maximo
 
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
@@ -117,7 +118,8 @@ class SomnolenciaSystem:
         self.buzzer = Buzzer(pin=17, active_high=True, enabled=True)
         self.dispatcher = AlertDispatcher(self.buzzer, self.mqtt)
         self.rule_engine = RuleEngine(self.event_store)
-        self.hands_worker = HandsWorker()
+        self.hands_enabled = os.getenv("SOMNO_HANDS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.hands_worker = HandsWorker() if self.hands_enabled else None
         self.alert_memory = AlertMemory()
         self._active_param_events: dict[str, float] = {}
         self._last_emergency_type: str | None = None
@@ -488,11 +490,13 @@ class SomnolenciaSystem:
         self.mqtt.start()
         self.supabase.start()
         self.rule_engine.start()
-        self.hands_worker.start()
+        if self.hands_worker:
+            self.hands_worker.start()
 
     def stop(self) -> None:
         self.rule_engine.stop()
-        self.hands_worker.stop()
+        if self.hands_worker:
+            self.hands_worker.stop()
         self.mqtt.stop()
         self.supabase.stop()
         self.buzzer.stop()
@@ -500,6 +504,7 @@ class SomnolenciaSystem:
 
     def run(self) -> None:
         preferred = int(self.cfg.camera_index)
+        print(f"[INFO] MP resolucion={self.MP_PROC_WIDTH}x{self.MP_PROC_HEIGHT} | manos={'ON' if self.hands_enabled else 'OFF'} | display={'ON' if self.display_enabled else 'OFF'}")
         print(f"[INFO] Abriendo camara (index preferido={preferred})...")
         camera_kind = ""
         camera = None
@@ -542,6 +547,7 @@ class SomnolenciaSystem:
 
         last_fps_ts = time.time()
         last_health_log_ts = time.time()
+        last_display_ts = 0.0
         fps_count = 0
         fps = 0.0
         first_frame_ok = False
@@ -587,9 +593,9 @@ class SomnolenciaSystem:
                 h, w = display_frame.shape[:2]
                 mp_h, mp_w = mp_frame.shape[:2]
                 face_out = self.face_mesh.process(mp_frame)
-                if frame_idx % max(1, self.HANDS_EVERY_N_FRAMES) == 0:
+                if self.hands_worker and frame_idx % max(1, self.HANDS_EVERY_N_FRAMES) == 0:
                     self.hands_worker.submit(mp_frame)
-                hand_out = self.hands_worker.latest()
+                hand_out = self.hands_worker.latest() if self.hands_worker else None
 
                 param_outputs = []
                 pitch = yaw = roll = 0.0
@@ -636,7 +642,11 @@ class SomnolenciaSystem:
                     elapsed = ts - state.started_at
                     self.calibration.ear_baseline = 0.995 * self.calibration.ear_baseline + 0.005 * max(ear, 0.01)
                     self.calibration.mar_baseline = 0.995 * self.calibration.mar_baseline + 0.005 * max(mar, 0.01)
-                    calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "45"))
+                    if face_detected:
+                        self.calibration.pitch_neutral = 0.99 * self.calibration.pitch_neutral + 0.01 * pitch
+                        self.calibration.roll_neutral = 0.99 * self.calibration.roll_neutral + 0.01 * roll
+                        self.calibration.yaw_neutral = 0.99 * self.calibration.yaw_neutral + 0.01 * yaw
+                    calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "300"))
                     if elapsed >= calibration_seconds:
                         self.calibration.calibrated = True
 
@@ -744,7 +754,8 @@ class SomnolenciaSystem:
                 last_score_out = score_out
                 last_telemetry = telemetry
 
-                if self.display_enabled:
+                if self.display_enabled and (ts - last_display_ts) >= self.DISPLAY_INTERVAL_S:
+                    last_display_ts = ts
                     hud_level = score_out["level"]
                     hud_colors = {0: (0, 255, 0), 1: (0, 255, 255), 2: (0, 180, 255), 3: (0, 80, 255), 4: (0, 0, 255)}
                     hud_color = hud_colors.get(hud_level, (0, 255, 255))
@@ -755,7 +766,7 @@ class SomnolenciaSystem:
                     cv2.imshow(self.WINDOW_NAME, display_frame)
                     key = cv2.waitKey(1) & 0xFF
                 else:
-                    key = -1
+                    key = cv2.waitKey(1) & 0xFF if self.display_enabled else -1
                 if key == ord("r"):
                     self.rotation_index = (self.rotation_index + 1) % 4
                     print(f"[CAM] Rotacion cambiada a {self.rotation_index * 90} grados")

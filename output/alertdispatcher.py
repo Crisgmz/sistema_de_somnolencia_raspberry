@@ -19,6 +19,8 @@ class AlertDispatcher:
     # Intervalo minimo entre publicaciones MQTT para el mismo nivel+reasons.
     MQTT_DEDUP_S = 2.0
 
+    SUPERVISOR_COOLDOWN_S = 30.0  # minimo entre notificaciones al supervisor
+
     def __init__(self, buzzer: Buzzer, mqtt: MqttPublisher) -> None:
         self.buzzer = buzzer
         self.mqtt = mqtt
@@ -27,6 +29,8 @@ class AlertDispatcher:
         self._last_mqtt_signature: tuple = ()
         self._last_mqtt_ts = 0.0
         self._suppressed_count = 0
+        self._last_supervisor_ts = 0.0
+        self._last_supervisor_sig: tuple = ()
 
     def _apply_hysteresis(self, raw_level: int, emergency: bool) -> int:
         now = time.time()
@@ -83,7 +87,30 @@ class AlertDispatcher:
             immediate = bool(emergency) or out_level >= 2
             self.mqtt.enqueue({"kind": "immediate" if immediate else "telemetry", "payload": enriched})
 
+        if self._should_notify_supervisor(out_level, emergency, reasons):
+            self.mqtt.enqueue_supervisor({
+                "vehicle_id": enriched.get("v"),
+                "driver_id": enriched.get("d"),
+                "ts": enriched.get("ts"),
+                "session_id": enriched.get("session_id"),
+                "level": out_level,
+                "emergency": bool(emergency),
+                "emergency_type": emergency_type,
+                "reasons": reasons,
+            })
+
         return enriched
+
+    def _should_notify_supervisor(self, level: int, emergency: bool, reasons: list) -> bool:
+        if not (bool(emergency) or level >= 3):
+            return False
+        now = time.time()
+        sig = (level, bool(emergency))
+        if sig == self._last_supervisor_sig and (now - self._last_supervisor_ts) < self.SUPERVISOR_COOLDOWN_S:
+            return False
+        self._last_supervisor_sig = sig
+        self._last_supervisor_ts = now
+        return True
 
     def stats(self) -> Dict:
         return {

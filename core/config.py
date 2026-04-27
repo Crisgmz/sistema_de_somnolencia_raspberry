@@ -14,6 +14,7 @@ class AppConfig:
     mqtt_username: str = ""
     mqtt_password: str = ""
     mqtt_topic: str = "test/connection"
+    mqtt_supervisor_topic: str = ""  # vacio = topic principal + "/supervisor"
     mqtt_tls: bool = True
     mqtt_qos: int = 1
     mqtt_client_id: str = "raspi-somnoalert"
@@ -34,6 +35,7 @@ class AppConfig:
             mqtt_username=os.getenv("EMQX_USERNAME", ""),
             mqtt_password=os.getenv("EMQX_PASSWORD", ""),
             mqtt_topic=os.getenv("MQTT_TOPIC", "test/connection"),
+            mqtt_supervisor_topic=os.getenv("MQTT_SUPERVISOR_TOPIC", ""),
             mqtt_tls=tls_raw in {"1", "true", "yes", "on"},
             mqtt_qos=int(os.getenv("MQTT_QOS", "1")),
             mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "raspi-somnoalert"),

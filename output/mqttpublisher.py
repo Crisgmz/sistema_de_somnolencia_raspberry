@@ -77,6 +77,27 @@ class MqttPublisher(threading.Thread):
         client.loop_start()
         self._client = client
 
+    def _supervisor_topic(self) -> str:
+        sup = self.config.mqtt_supervisor_topic
+        if not sup:
+            base = self.config.mqtt_topic.format(vehicle_id=self.config.vehicle_id)
+            return base + "/supervisor"
+        return sup.format(vehicle_id=self.config.vehicle_id)
+
+    def _publish_supervisor(self, payload: Dict) -> None:
+        if not self._client:
+            return
+        topic = self._supervisor_topic()
+        try:
+            data = json.dumps(payload, ensure_ascii=False)
+            result = self._client.publish(topic, data, qos=self.config.mqtt_qos)
+            if result.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                print(f"[MQTT] Supervisor notificado en {topic}")
+            else:
+                self._last_error = f"supervisor_rc={result.rc}"
+        except Exception as exc:
+            self._last_error = f"supervisor: {exc}"
+
     def enqueue(self, payload: Dict) -> None:
         try:
             self.queue.put_nowait(payload)
@@ -84,6 +105,12 @@ class MqttPublisher(threading.Thread):
             self._dropped_count += 1
             if payload.get("kind") != "immediate":
                 self._latest_telemetry = payload.get("payload", {})
+
+    def enqueue_supervisor(self, payload: Dict) -> None:
+        try:
+            self.queue.put_nowait({"kind": "supervisor", "payload": payload})
+        except queue.Full:
+            self._dropped_count += 1
 
     def set_level(self, level: int) -> None:
         self._level = max(0, min(4, int(level)))
@@ -135,7 +162,9 @@ class MqttPublisher(threading.Thread):
 
             try:
                 msg = self.queue.get(timeout=0.2)
-                if msg.get("kind") == "immediate":
+                if msg.get("kind") == "supervisor":
+                    self._publish_supervisor(msg["payload"])
+                elif msg.get("kind") == "immediate":
                     self._publish_now(msg["payload"], is_immediate=True)
                 else:
                     self._latest_telemetry = msg.get("payload", {})

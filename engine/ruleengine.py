@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from core.eventstore import EventStore
 
@@ -17,6 +17,7 @@ class RuleEngine(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._latest: Dict = {"forced_min_level": 0, "reasons": []}
+        self._uninterrupted_start_ts: Optional[float] = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -58,8 +59,20 @@ class RuleEngine(threading.Thread):
             reasons.append("YAWN_OR_BLINK_CLUSTER")
 
         if self._count(win_60, "MONOTONY") >= 5 and self._count(win_60, "TIME_ON_TASK") >= 5:
+            if self._uninterrupted_start_ts is None:
+                self._uninterrupted_start_ts = now_ts
             forced_level = max(forced_level, 2)
             reasons.append("LONG_TASK_MONOTONY")
+
+        # Conduccion ininterrumpida: una vez activada, persiste mientras TIME_ON_TASK siga ocurriendo
+        if self._uninterrupted_start_ts is not None:
+            win_5_local = self.event_store.window(now_ts, 5 * 60)
+            if self._count(win_5_local, "TIME_ON_TASK") >= 1:
+                forced_level = max(forced_level, 2)
+                if "LONG_TASK_MONOTONY" not in reasons:
+                    reasons.append("UNINTERRUPTED_DRIVING")
+            else:
+                self._uninterrupted_start_ts = None
 
         return {"forced_min_level": forced_level, "reasons": reasons}
 
