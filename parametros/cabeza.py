@@ -48,8 +48,23 @@ class CabezaParametros:
         self.last_recovery = 0.0
         self.pitch_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)
 
-    def _pose(self, landmarks: Sequence, frame_w: int, frame_h: int) -> Tuple[float, float, float]:
-        image_points = np.asarray([[landmarks[i].x * frame_w, landmarks[i].y * frame_h] for i in POSE_IDX], dtype=np.float64)
+    def _pose(self, landmarks: Sequence, frame_w: int, frame_h: int, rotation_index: int = 0) -> Tuple[float, float, float]:
+        image_points = []
+        for i in POSE_IDX:
+            x = landmarks[i].x * frame_w
+            y = landmarks[i].y * frame_h
+            
+            # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+            if rotation_index == 1:  # 90 grados horario
+                x, y = y, frame_w - x
+            elif rotation_index == 2:  # 180 grados
+                x, y = frame_w - x, frame_h - y
+            elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+                x, y = frame_h - y, x
+                
+            image_points.append([x, y])
+        
+        image_points = np.asarray(image_points, dtype=np.float64)
         camera_matrix = np.asarray([[frame_w, 0, frame_w / 2.0], [0, frame_w, frame_h / 2.0], [0, 0, 1]], dtype=np.float64)
         ok, rvec, _ = cv2.solvePnP(MODEL_POINTS, image_points, camera_matrix, np.zeros((4, 1), dtype=np.float64), flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok:
@@ -57,8 +72,8 @@ class CabezaParametros:
         rot_matrix, _ = cv2.Rodrigues(rvec)
         return _rotation_to_euler_deg(rot_matrix)
 
-    def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration):
-        pitch, yaw, roll = self._pose(landmarks, frame_w, frame_h)
+    def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration, rotation_index: int = 0):
+        pitch, yaw, roll = self._pose(landmarks, frame_w, frame_h, rotation_index)
         velocity = 0.0
         if self.prev_pitch is not None and self.prev_ts is not None:
             velocity = (pitch - self.prev_pitch) / max(1e-3, ts - self.prev_ts)

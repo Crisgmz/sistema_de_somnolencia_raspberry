@@ -225,12 +225,12 @@ def main():
                             connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
                         )
 
-                    ear_izq = get_ear(face_landmarks.landmark, OJO_IZQ, w, h)
-                    ear_der = get_ear(face_landmarks.landmark, OJO_DER, w, h)
+                    ear_izq = get_ear(face_landmarks.landmark, OJO_IZQ, w, h, 3)  # 270 grados como normal
+                    ear_der = get_ear(face_landmarks.landmark, OJO_DER, w, h, 3)
                     ear = (ear_izq + ear_der) / 2.0
 
-                    mar = get_mar(face_landmarks.landmark, BOCA, w, h)
-                    pitch, yaw, roll = get_head_pose(face_landmarks.landmark, w, h)
+                    mar = get_mar(face_landmarks.landmark, BOCA, w, h, 3)
+                    pitch, yaw, roll = get_head_pose(face_landmarks.landmark, w, h, 3)
                     left_eye_pts = np.array(
                         [[face_landmarks.landmark[i].x * w, face_landmarks.landmark[i].y * h] for i in OJO_IZQ],
                         dtype=np.float32,
@@ -289,8 +289,7 @@ def main():
                         tip = hand_landmarks.landmark[idx]
                         tip_pt = np.array([tip.x * w, tip.y * h], dtype=np.float32)
                         d_left = float(np.linalg.norm(tip_pt - eye_left_center))
-                        d_right = float(np.linalg.norm(tip_pt - eye_right_center))
-                        if min(d_left, d_right) <= rub_dist_thr and ear <= params.eye_rub_ear_max:
+                        d_right = float(np.linalg.norm(tip_pt - eye_right_center))                        if min(d_left, d_right) <= rub_dist_thr and ear <= params.eye_rub_ear_max:
                             hand_near_eye = True
                             break
                     if hand_near_eye:

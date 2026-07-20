@@ -673,25 +673,49 @@ class SomnolenciaSystem:
                 if face_out.multi_face_landmarks:
                     face_detected = True
                     lm = face_out.multi_face_landmarks[0].landmark
-                    ear_left = get_ear(lm, OJO_IZQ, mp_w, mp_h)
-                    ear_right = get_ear(lm, OJO_DER, mp_w, mp_h)
+                    ear_left = get_ear(lm, OJO_IZQ, mp_w, mp_h, self.rotation_index)
+                    ear_right = get_ear(lm, OJO_DER, mp_w, mp_h, self.rotation_index)
                     ear = (ear_left + ear_right) * 0.5
-                    mar = get_mar(lm, BOCA, mp_w, mp_h)
+                    mar = get_mar(lm, BOCA, mp_w, mp_h, self.rotation_index)
 
-                    left_pts = np.asarray([[lm[i].x * mp_w, lm[i].y * mp_h] for i in OJO_IZQ], dtype=np.float32)
-                    right_pts = np.asarray([[lm[i].x * mp_w, lm[i].y * mp_h] for i in OJO_DER], dtype=np.float32)
+                    left_pts = []
+                    right_pts = []
+                    for i in OJO_IZQ:
+                        x = lm[i].x * mp_w
+                        y = lm[i].y * mp_h
+                        if self.rotation_index == 1:  # 90 grados horario
+                            x, y = y, mp_w - x
+                        elif self.rotation_index == 2:  # 180 grados
+                            x, y = mp_w - x, mp_h - y
+                        elif self.rotation_index == 3:  # 90 grados antihorario
+                            x, y = mp_h - y, x
+                        left_pts.append([x, y])
+                    
+                    for i in OJO_DER:
+                        x = lm[i].x * mp_w
+                        y = lm[i].y * mp_h
+                        if self.rotation_index == 1:  # 90 grados horario
+                            x, y = y, mp_w - x
+                        elif self.rotation_index == 2:  # 180 grados
+                            x, y = mp_w - x, mp_h - y
+                        elif self.rotation_index == 3:  # 90 grados antihorario
+                            x, y = mp_h - y, x
+                        right_pts.append([x, y])
+                    
+                    left_pts = np.asarray(left_pts, dtype=np.float32)
+                    right_pts = np.asarray(right_pts, dtype=np.float32)
                     left_center = np.mean(left_pts, axis=0)
                     right_center = np.mean(right_pts, axis=0)
 
-                    out_cabeza = self.cabeza.update(ts, lm, mp_w, mp_h, self.calibration)
+                    out_cabeza = self.cabeza.update(ts, lm, mp_w, mp_h, self.calibration, self.rotation_index)
                     pitch = out_cabeza["PITCH"]["value"]
                     yaw = out_cabeza["YAW"]["value"]
                     roll = out_cabeza["ROLL"]["value"]
 
                     out_ojos = self.ojos.update(ts, ear, left_center, right_center, self.calibration)
                     out_boca = self.boca.update(ts, mar, self.calibration)
-                    out_facial = self.facial.update(ts, lm, mp_w, mp_h, self.calibration)
-                    out_manos = self.manos.update(ts, hand_out, left_center, right_center, mp_w, mp_h, self.calibration)
+                    out_facial = self.facial.update(ts, lm, mp_w, mp_h, self.calibration, self.rotation_index)
+                    out_manos = self.manos.update(ts, hand_out, left_center, right_center, mp_w, mp_h, self.calibration, self.rotation_index)
 
                     fixation_value = out_ojos["FIXATION"]["value"]
 

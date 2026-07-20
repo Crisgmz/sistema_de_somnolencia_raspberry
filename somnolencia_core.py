@@ -13,22 +13,45 @@ BOCA = [61, 291, 0, 17, 84, 314, 405, 321]
 POSE_IDX = [1, 152, 33, 263, 61, 291]
 
 
-def get_ear(landmarks, points, w, h):
+def get_ear(landmarks, points, w, h, rotation_index=0):
     coords = []
     for i in points:
         lm = landmarks[i]
-        coords.append(np.array([lm.x * w, lm.y * h]))
+        x = lm.x * w
+        y = lm.y * h
+        
+        # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+        if rotation_index == 1:  # 90 grados horario
+            x, y = y, w - x
+        elif rotation_index == 2:  # 180 grados
+            x, y = w - x, h - y
+        elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+            x, y = h - y, x
+            
+        coords.append(np.array([x, y]))
+    
     p2_p6 = dist.euclidean(coords[1], coords[5])
     p3_p5 = dist.euclidean(coords[2], coords[4])
     p1_p4 = dist.euclidean(coords[0], coords[3])
     return (p2_p6 + p3_p5) / (2.0 * p1_p4) if p1_p4 > 0 else 0.0
 
 
-def get_mar(landmarks, points, w, h):
+def get_mar(landmarks, points, w, h, rotation_index=0):
     coords = []
     for i in points:
         lm = landmarks[i]
-        coords.append(np.array([lm.x * w, lm.y * h]))
+        x = lm.x * w
+        y = lm.y * h
+        
+        # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+        if rotation_index == 1:  # 90 grados horario
+            x, y = y, w - x
+        elif rotation_index == 2:  # 180 grados
+            x, y = w - x, h - y
+        elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+            x, y = h - y, x
+            
+        coords.append(np.array([x, y]))
 
     # MAR = (A + B + C) / (2*D)
     a = dist.euclidean(coords[1], coords[7])
@@ -54,7 +77,7 @@ def _rotation_to_euler_deg(rot_matrix):
     return float(np.degrees(x)), float(np.degrees(y)), float(np.degrees(z))
 
 
-def get_head_pose(landmarks, w, h):
+def get_head_pose(landmarks, w, h, rotation_index=0):
     # Modelo 3D estandarizado de rostro (6 puntos)
     model_points = np.array(
         [
@@ -68,10 +91,23 @@ def get_head_pose(landmarks, w, h):
         dtype=np.float64,
     )
 
-    image_points = np.array(
-        [[landmarks[i].x * w, landmarks[i].y * h] for i in POSE_IDX],
-        dtype=np.float64,
-    )
+    image_points = []
+    for i in POSE_IDX:
+        lm = landmarks[i]
+        x = lm.x * w
+        y = lm.y * h
+        
+        # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+        if rotation_index == 1:  # 90 grados horario
+            x, y = y, w - x
+        elif rotation_index == 2:  # 180 grados
+            x, y = w - x, h - y
+        elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+            x, y = h - y, x
+            
+        image_points.append([x, y])
+    
+    image_points = np.array(image_points, dtype=np.float64)
 
     camera_matrix = np.array(
         [[w, 0, w / 2.0], [0, w, h / 2.0], [0, 0, 1]],

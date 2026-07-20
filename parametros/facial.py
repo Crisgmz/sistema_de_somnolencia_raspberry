@@ -18,8 +18,23 @@ class FacialParametros:
         self.tone_baseline: Optional[float] = None
         self.pairs = [(33, 263), (61, 291), (93, 323), (159, 386), (145, 374)]
 
-    def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration):
-        xy = np.asarray([[p.x * frame_w, p.y * frame_h] for p in landmarks], dtype=np.float32)
+    def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration, rotation_index: int = 0):
+        xy = []
+        for p in landmarks:
+            x = p.x * frame_w
+            y = p.y * frame_h
+            
+            # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+            if rotation_index == 1:  # 90 grados horario
+                x, y = y, frame_w - x
+            elif rotation_index == 2:  # 180 grados
+                x, y = frame_w - x, frame_h - y
+            elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+                x, y = frame_h - y, x
+                
+            xy.append([x, y])
+        
+        xy = np.asarray(xy, dtype=np.float32)
         face_w = max(1.0, float(np.linalg.norm(xy[33] - xy[263])))
 
         stability = 1.0

@@ -29,6 +29,7 @@ class ManosParametros:
         frame_w: int,
         frame_h: int,
         calibration: Calibration,
+        rotation_index: int = 0,
     ):
         left = np.asarray(left_eye_center, dtype=np.float32)
         right = np.asarray(right_eye_center, dtype=np.float32)
@@ -38,7 +39,18 @@ class ManosParametros:
             for hand in hand_results.multi_hand_landmarks:
                 for idx in (4, 8, 12, 16, 20):
                     tip = hand.landmark[idx]
-                    tip_px = np.asarray([tip.x * frame_w, tip.y * frame_h], dtype=np.float32)
+                    x = tip.x * frame_w
+                    y = tip.y * frame_h
+                    
+                    # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
+                    if rotation_index == 1:  # 90 grados horario
+                        x, y = y, frame_w - x
+                    elif rotation_index == 2:  # 180 grados
+                        x, y = frame_w - x, frame_h - y
+                    elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
+                        x, y = frame_h - y, x
+                    
+                    tip_px = np.asarray([x, y], dtype=np.float32)
                     if min(float(np.linalg.norm(tip_px - left)), float(np.linalg.norm(tip_px - right))) <= 36.0:
                         touch_now = True
                         break
