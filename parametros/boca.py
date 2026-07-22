@@ -15,9 +15,15 @@ class BocaParametros:
         self.last_yawn_dur = 0.0
         self.yawn_count = 0
 
-    def update(self, ts: float, mar: float, calibration: Calibration):
+    def update(self, ts: float, mar: float, calibration: Calibration, pose_reliable: bool = True):
+        reliable = bool(pose_reliable)
         thr = max(0.34, calibration.mar_baseline * 1.4)
-        if mar >= thr and not self.yawn_active:
+        if not reliable:
+            # Pose no fiable: abortar bostezo en curso sin contarlo. Un giro/
+            # inclinacion fuerte deforma la boca y falsea el MAR.
+            self.yawn_active = False
+            self.yawn_start_ts = None
+        elif mar >= thr and not self.yawn_active:
             self.yawn_active = True
             self.yawn_start_ts = ts
         elif mar < thr and self.yawn_active:
@@ -26,7 +32,7 @@ class BocaParametros:
             self.yawn_count += 1
             self.yawn_start_ts = None
 
-        event = calibration.calibrated and mar >= thr
+        event = reliable and calibration.calibrated and mar >= thr
         return {
             "MAR": build_param_output("MAR", mar, normalize_linear(mar, calibration.mar_baseline * 1.1, calibration.mar_baseline * 2.0), event, 4 if event else 0, ts=ts),
             "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 2.0, 7.0), calibration.calibrated and self.yawn_count >= 4, 5, ts=ts),

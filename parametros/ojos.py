@@ -1,7 +1,8 @@
-"""Parametros oculares: PERCLOS, Tc, Fb, IBI, amplitud, velocidad reapertura, fijacion."""
+"""Parametros oculares: PERCLOS (P80 FHWA), Tc, Fb, IBI, amplitud, velocidad reapertura, fijacion."""
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from typing import Deque, Optional, Sequence, Tuple
 
@@ -11,10 +12,41 @@ from core.calibration import Calibration
 from core.common_types import build_param_output, normalize_linear
 
 
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class OjosParametros:
     def __init__(self, perclos_window_s: float = 60.0, fixation_motion_px_s: float = 28.0) -> None:
         self.perclos_window_s = float(perclos_window_s)
         self.fixation_motion_px_s = float(fixation_motion_px_s)
+
+        # --- PERCLOS segun el criterio P80 (FHWA): fraccion de tiempo con el
+        # parpado cubriendo >=80% del ojo. Se mide con un umbral de EAR cercano
+        # al cierre, independiente del umbral de parpadeo, para no alterar la
+        # deteccion de blinks. Umbrales alineados con la literatura y
+        # configurables por entorno para poder afinarlos con el arnes de validacion.
+        self.perclos_close_frac = _envf("SOMNO_PERCLOS_CLOSE_FRAC", 0.80)  # P80
+        self.perclos_closed_floor = _envf("SOMNO_PERCLOS_CLOSED_FLOOR", 0.08)  # EAR ojo cerrado
+        self.perclos_onset = _envf("SOMNO_PERCLOS_ONSET", 0.15)  # umbral somnolencia (15%)
+        self.perclos_severe = _envf("SOMNO_PERCLOS_SEVERE", 0.30)  # somnolencia marcada
+        # Microsueno: cierre ocular sostenido. La literatura situa el inicio del
+        # microsueno / lapso de atencion en >=500 ms. Configurable.
+        self.microsleep_ms = _envf("SOMNO_MICROSLEEP_MS", 500.0)
+
+        # Ajuste de umbral de cierre segun condiciones adversas. Con poca luz o
+        # lentes, los landmarks del parpado son mas ruidosos y el EAR puede
+        # caer sin que el ojo este realmente cerrado -> se exige un cierre algo
+        # mas marcado (factor <1 sobre close_thr) para no generar falsos cierres.
+        # El PERCLOS (temporal) sigue capturando el cierre sostenido real.
+        self.night_close_scale = _envf("SOMNO_NIGHT_CLOSE_SCALE", 0.90)
+        self.glasses_close_scale = _envf("SOMNO_GLASSES_CLOSE_SCALE", 0.90)
+        # Con lentes, el ojo "cerrado" suele medir un EAR mas alto (reflejos,
+        # montura): se sube el piso de cierre del PERCLOS.
+        self.glasses_perclos_floor_bonus = _envf("SOMNO_GLASSES_PERCLOS_FLOOR", 0.02)
 
         self.eye_hist: Deque[Tuple[float, int]] = deque(maxlen=8000)
         self.blink_times: Deque[float] = deque(maxlen=3000)
@@ -49,20 +81,58 @@ class OjosParametros:
         self.last_center_ts = ts
         return float(ts - (self.fix_start_ts if self.fix_start_ts is not None else ts))
 
-    def update(self, ts: float, ear: float, left_eye_center: Sequence[float], right_eye_center: Sequence[float], calibration: Calibration):
-        close_thr = max(0.12, calibration.ear_baseline * 0.75)
-        open_thr = max(close_thr + 0.025, calibration.ear_baseline * 0.88)
+    def update(self, ts: float, ear: float, left_eye_center: Sequence[float], right_eye_center: Sequence[float], calibration: Calibration, pose_reliable: bool = True):
+        reliable = bool(pose_reliable)
+        # Endurecimiento del umbral de cierre en condiciones adversas (noche/lentes).
+        close_scale = 1.0
+        if getattr(calibration, "nightmode", False):
+            close_scale *= self.night_close_scale
+        if getattr(calibration, "glassesmode", False):
+            close_scale *= self.glasses_close_scale
 
-        if ear > open_thr:
-            self.open_ref = 0.95 * self.open_ref + 0.05 * ear
+        # Referencia ADAPTATIVA de "ojo abierto": envolvente superior del EAR
+        # (sube rapido, baja despacio). Se adapta al nivel real de operacion
+        # (gaze, distancia, montura) en vez de fiarse solo del baseline de
+        # calibracion, que puede no coincidir con la pose real y provocar cierres
+        # FALSOS (EAR de reposo por debajo del umbral fijo). Solo se actualiza con
+        # el ojo claramente abierto (ear > mitad de la referencia) para que un
+        # cierre real NO arrastre la referencia hacia abajo.
+        if reliable and ear > 0.5 * self.open_ref:
+            if ear > self.open_ref:
+                self.open_ref = 0.5 * self.open_ref + 0.5 * ear
+            else:
+                self.open_ref = 0.98 * self.open_ref + 0.02 * ear
+        # Nivel de apertura de referencia: el mayor entre el adaptativo y un piso
+        # del baseline (evita que caiga demasiado por ruido).
+        open_level = max(self.open_ref, 0.6 * calibration.ear_baseline)
+        close_thr = max(0.10, open_level * 0.70 * close_scale)
+        open_thr = max(close_thr + 0.025, open_level * 0.82)
+        perclos_floor = self.perclos_closed_floor + (
+            self.glasses_perclos_floor_bonus if getattr(calibration, "glassesmode", False) else 0.0
+        )
 
-        closed = 1 if ear < close_thr else 0
-        self.eye_hist.append((float(ts), closed))
+        # PERCLOS: solo se contabilizan frames con pose FIABLE. Girar la cara
+        # escorza el ojo y colapsa el EAR; contar esos frames como "cerrado"
+        # inflaba el PERCLOS con falsos positivos. Al excluirlos, la ventana
+        # mantiene su ultimo estado fiable en vez de contaminarse.
+        if reliable:
+            open_ref_ear = max(open_level, perclos_floor + 0.02)
+            p80_thr = perclos_floor + (1.0 - self.perclos_close_frac) * (open_ref_ear - perclos_floor)
+            closed = 1 if ear <= p80_thr else 0
+            self.eye_hist.append((float(ts), closed))
         while self.eye_hist and (ts - self.eye_hist[0][0]) > self.perclos_window_s:
             self.eye_hist.popleft()
 
         blink_detected = False
-        if ear < close_thr and not self.blink_active:
+        if not reliable:
+            # Pose no fiable (cara girada/inclinada): abortar cualquier parpadeo
+            # en curso SIN registrar metricas, para no generar un falso
+            # "ojo cerrado prolongado" mientras se vira la cabeza.
+            self.blink_active = False
+            self.blink_start_ts = None
+            self.eye_closed_event_reported = False
+            self.blink_metrics_event_pending = False
+        elif ear < close_thr and not self.blink_active:
             self.blink_active = True
             self.blink_start_ts = ts
             self.eye_closed_event_reported = False
@@ -96,7 +166,7 @@ class OjosParametros:
         if self.blink_active and self.blink_start_ts is not None:
             eye_closed_ms = max(0.0, (ts - self.blink_start_ts) * 1000.0)
 
-        immediate_eye_closed_event = eye_closed_ms >= 900.0 and not self.eye_closed_event_reported
+        immediate_eye_closed_event = eye_closed_ms >= self.microsleep_ms and not self.eye_closed_event_reported
         if immediate_eye_closed_event:
             self.eye_closed_event_reported = True
         blink_tc_event = self.blink_metrics_event_pending and calibration.calibrated and self.last_tc_ms >= 800.0
@@ -104,9 +174,9 @@ class OjosParametros:
         reopen_speed_event = self.blink_metrics_event_pending and calibration.calibrated and 0.0 < self.last_reopen < 0.12
         self.blink_metrics_event_pending = False
         return {
-            "EAR": build_param_output("EAR", ear, normalize_linear(max(0.0, calibration.ear_baseline - ear), 0.0, 0.20), calibration.calibrated and ear < close_thr, 2, ts=ts),
-            "EYE_CLOSED_MS": build_param_output("EYE_CLOSED_MS", eye_closed_ms, normalize_linear(eye_closed_ms, 600.0, 2500.0), immediate_eye_closed_event, 8, ts=ts),
-            "PERCLOS": build_param_output("PERCLOS", perclos, normalize_linear(perclos, 0.22, 0.6), calibration.calibrated and perclos >= 0.35, 10, ts=ts),
+            "EAR": build_param_output("EAR", ear, normalize_linear(max(0.0, calibration.ear_baseline - ear), 0.0, 0.20), reliable and calibration.calibrated and ear < close_thr, 2, ts=ts),
+            "EYE_CLOSED_MS": build_param_output("EYE_CLOSED_MS", eye_closed_ms, normalize_linear(eye_closed_ms, self.microsleep_ms, 3000.0), immediate_eye_closed_event, 8 if eye_closed_ms < 1500.0 else 12, ts=ts),
+            "PERCLOS": build_param_output("PERCLOS", perclos, normalize_linear(perclos, self.perclos_onset, self.perclos_severe * 2.0), calibration.calibrated and perclos >= self.perclos_onset, 10 if perclos < self.perclos_severe else 14, ts=ts),
             "BLINK_TC": build_param_output("BLINK_TC", self.last_tc_ms, normalize_linear(self.last_tc_ms, calibration.tc_baseline_ms, 700.0), blink_tc_event, 6, ts=ts),
             "BLINK_FB": build_param_output("BLINK_FB", fb_per_min, max(normalize_linear(fb_per_min, 0.0, 4.0), normalize_linear(fb_per_min, 24.0, 40.0)), calibration.calibrated and (fb_per_min < 4.0 or fb_per_min > 32.0), 5, ts=ts),
             "IBI": build_param_output("IBI", ibi_s, normalize_linear(ibi_s, 4.0, 12.0), calibration.calibrated and ibi_s >= 8.0, 4, ts=ts),

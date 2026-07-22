@@ -1,6 +1,13 @@
+#!/usr/bin/env python3
 """Main industrial para deteccion de somnolencia en Raspberry Pi 4.
 
 Estructura simplificada por tipo de parametro dentro de carpeta `parametros/`.
+
+Se puede ejecutar de cualquiera de estas formas; todas se re-lanzan solas con
+el interprete del venv (.venv/bin/python):
+    python3 main.py
+    ./main.py
+    (boton "Run" del editor)
 """
 
 from __future__ import annotations
@@ -9,11 +16,24 @@ import os
 import queue
 import signal
 import threading
-import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+# --- Auto-relanzado con el interprete del venv ---------------------------
+# El sistema depende de paquetes que solo estan en el venv de Python 3.12
+# (.venv/): cv2, mediapipe, picamera2, etc. Si este archivo se ejecuta con
+# otro Python (por ejemplo `python3 main.py` con el 3.13 del sistema), se
+# re-lanza a si mismo usando .venv/bin/python para que "ejecutar main.py"
+# siempre funcione, sin importar como se invoque.
+import sys as _sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VENV_DIR = os.path.join(_HERE, ".venv")
+_VENV_PY = os.path.join(_VENV_DIR, "bin", "python")
+if os.path.abspath(_sys.prefix) != _VENV_DIR and os.path.exists(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY, os.path.abspath(__file__)] + _sys.argv[1:])
+# -------------------------------------------------------------------------
 
 import cv2
 import mediapipe as mp
@@ -26,8 +46,11 @@ from core.alertmemory import AlertMemory
 from core.calibration import Calibration
 from core.config import AppConfig
 from engine.emergencydetector import detect_emergency
+from engine.corroboration import LevelStabilizer, StabilizerConfig, family_of
 from core.eventstore import EventStore
 from core.scorestate import ScoreStateStore
+from core.calibrationstore import CalibrationStore
+from core.common_types import CircularMeanDeg, angle_delta_deg
 from engine.fatiguescore import DynamicFatigueScore
 from output.mqttpublisher import MqttPublisher
 from parametros.boca import BocaParametros
@@ -37,8 +60,9 @@ from parametros.facial import FacialParametros
 from parametros.manos import ManosParametros
 from parametros.ojos import OjosParametros
 from engine.ruleengine import RuleEngine
-from somnolencia_core import BOCA, OJO_DER, OJO_IZQ, get_ear, get_mar
+from somnolencia_core import BOCA, OJO_DER, OJO_IZQ, eye_metrics, fuse_ear, get_ear, get_mar
 from storage.supabasesync import SupabaseSync
+from storage.session_recorder import SessionRecorder, build_record
 from camera_setup import describe_camera_environment, list_opencv_candidates, setup_camera
 
 
@@ -98,14 +122,47 @@ class SomnolenciaSystem:
     # Reducido a 480p para mejorar latencia/deteccion en Raspberry.
     CAPTURE_WIDTH = 640
     CAPTURE_HEIGHT = 480
-    MP_PROC_WIDTH = 320
-    MP_PROC_HEIGHT = 180
+    # Lado mayor del frame para MediaPipe. CRITICO: el redimensionado PRESERVA la
+    # relacion de aspecto. Antes se forzaba 320x180 (16:9) sobre una captura 4:3
+    # (640x480), lo que ESTIRABA la cara ~33% y distorsionaba EAR/MAR/asimetria y
+    # los puntos 2D de solvePnP (pose inestable). Nunca volver a un tamano fijo.
+    MP_PROC_LONG = 320
     HANDS_EVERY_N_FRAMES = 4
     DISPLAY_INTERVAL_S = 1.0 / 15.0  # limita display a 15 fps maximo
 
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
         self.calibration = Calibration()
+        # Modo lentes: manual por entorno (la autodeteccion fiable de lentes no
+        # es viable). Ajusta umbrales oculares. El modo noche se autodetecta por
+        # iluminacion en parametros/contexto.py.
+        self.calibration.glassesmode = os.getenv("SOMNO_GLASSES", "0").strip().lower() in ("1", "true", "yes", "on")
+        # Persistencia de calibracion por conductor: si hay una reciente y valida
+        # se restaura y se evita la ventana de 5 min desprotegida al arrancar.
+        self.calibration_store = CalibrationStore(config.sqlite_queue_path, config.vehicle_id, config.driver_id)
+        self.calibration_max_age_s = float(os.getenv("SOMNO_CALIB_MAX_AGE_S", str(7 * 24 * 3600)))
+        force_calib = os.getenv("SOMNO_FORCE_CALIB", "0").strip().lower() in ("1", "true", "yes", "on")
+        if not force_calib:
+            saved_calib = self.calibration_store.load(max_age_s=self.calibration_max_age_s)
+            # Guarda: una calibracion real NUNCA deja los tres neutros de pose en
+            # exactamente 0 (el pitch/roll crudos de solvePnP no estan centrados
+            # en 0). Si estan a 0 es una "no-calibracion" (defaults) y se descarta
+            # para forzar recalibracion, evitando arrastrar un pitch_delta espurio.
+            pose_untouched = saved_calib and (
+                abs(float(saved_calib.get("pitch_neutral", 0.0))) < 1.0
+                and abs(float(saved_calib.get("yaw_neutral", 0.0))) < 1.0
+                and abs(float(saved_calib.get("roll_neutral", 0.0))) < 1.0
+            )
+            if saved_calib and not pose_untouched:
+                self.calibration.restore(saved_calib)
+                self.calibration.calibrated = True
+                print(
+                    "[CALIB] Calibracion restaurada "
+                    f"ear={self.calibration.ear_baseline:.3f} mar={self.calibration.mar_baseline:.3f} "
+                    f"pitch0={self.calibration.pitch_neutral:.1f} yaw0={self.calibration.yaw_neutral:.1f}"
+                )
+            elif pose_untouched:
+                print("[CALIB] Calibracion guardada invalida (neutros de pose en 0), se recalibrara")
         self.event_store = EventStore(config.sqlite_queue_path)
         self.score = DynamicFatigueScore()
         self.score_state_store = ScoreStateStore(config.sqlite_queue_path, config.vehicle_id, config.driver_id)
@@ -129,6 +186,51 @@ class SomnolenciaSystem:
         self.buzzer = Buzzer(pin=17, active_high=True, enabled=True)
         self.dispatcher = AlertDispatcher(self.buzzer, self.mqtt)
         self.rule_engine = RuleEngine(self.event_store)
+        self.level_stabilizer = LevelStabilizer(StabilizerConfig.from_env(os.getenv))
+        # Estabilidad minima de landmarks para aceptar el rostro como valido
+        # (evita falsos positivos por caras espurias en texturas de fondo).
+        self.face_quality_min = float(os.getenv("SOMNO_FACE_QUALITY_MIN", "0.30"))
+        # Periodo de gracia ante perdida breve de rostro: durante estos segundos
+        # NO se decae el score ni se relaja la histeresis del nivel, de modo que
+        # quitar la cara y volver a ponerla no borra los datos acumulados.
+        self.face_grace_s = float(os.getenv("SOMNO_FACE_GRACE_S", "4.0"))
+        self._face_lost_since: float | None = None
+        # Medias CIRCULARES para el neutro de pose. El pitch/roll de solvePnP
+        # rondan ±180 y saltan el wraparound; una EMA lineal da un neutro basura
+        # (promediar +170 y -170 da 0). La media circular via sin/cos lo resuelve.
+        self._pitch_mean = CircularMeanDeg(0.01)
+        self._roll_mean = CircularMeanDeg(0.01)
+        self._yaw_mean = CircularMeanDeg(0.01)
+        # Umbrales de fiabilidad por pose de cabeza (grados, respecto al neutro
+        # calibrado). Fuera de estos rangos la geometria 2D de ojos/boca se
+        # escorza y NO es confiable, asi que se suprimen sus eventos para evitar
+        # falsos positivos al virar/inclinar la cara. Configurable por entorno.
+        self.yaw_ocular_max = float(os.getenv("SOMNO_YAW_OCULAR_MAX", "38.0"))
+        self.pitch_ocular_max = float(os.getenv("SOMNO_PITCH_OCULAR_MAX", "28.0"))
+        self.roll_ocular_max = float(os.getenv("SOMNO_ROLL_OCULAR_MAX", "35.0"))
+        self.yaw_mouth_max = float(os.getenv("SOMNO_YAW_MOUTH_MAX", "45.0"))
+        self.pitch_mouth_max = float(os.getenv("SOMNO_PITCH_MOUTH_MAX", "32.0"))
+        # Iluminacion minima DE LA CARA (recuadro facial, no del fondo) para
+        # fiarse de las metricas oculares/faciales. Por debajo (cara realmente a
+        # oscuras) los landmarks son ruido y generan falsos positivos. Con un
+        # fondo oscuro pero la cara iluminada, esto ya NO suprime nada.
+        self.min_illumination = float(os.getenv("SOMNO_MIN_ILLUMINATION", "0.12"))
+        # Transicion de la fusion de EAR entre ojos segun yaw (grados).
+        self.ear_yaw_soft = float(os.getenv("SOMNO_EAR_YAW_SOFT", "12.0"))
+        self.ear_yaw_hard = float(os.getenv("SOMNO_EAR_YAW_HARD", "30.0"))
+        # Distraccion / mirada fuera de via: un giro (yaw) sostenido no es fatiga,
+        # pero SI es distraccion. Se marca como senal independiente (no altera el
+        # score de somnolencia). Umbrales configurables por entorno.
+        self.distraction_enabled = os.getenv("SOMNO_DISTRACTION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.distraction_yaw = float(os.getenv("SOMNO_DISTRACTION_YAW", "40.0"))
+        self.distraction_min_s = float(os.getenv("SOMNO_DISTRACTION_MIN_S", "2.5"))
+        # Aviso audible de distraccion: chirp breve distinto del de fatiga, con
+        # re-aviso periodico mientras la mirada siga fuera de via.
+        self.distraction_buzzer = os.getenv("SOMNO_DISTRACTION_BUZZER", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.distraction_rechirp_s = float(os.getenv("SOMNO_DISTRACTION_RECHIRP_S", "3.0"))
+        self._distraction_since: float | None = None
+        self._distraction_reported = False
+        self._distraction_last_chirp = 0.0
         self.hands_enabled = os.getenv("SOMNO_HANDS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
         self.hands_worker = HandsWorker() if self.hands_enabled else None
         self.alert_memory = AlertMemory()
@@ -137,9 +239,13 @@ class SomnolenciaSystem:
         self._last_emergency_started_at: float | None = None
         self._minute_samples: list[dict] = []
 
+        # Iris/refine_landmarks: refina parpados+iris -> EAR mas estable y menos
+        # falsos cierres. Cuesta algo de CPU; si el FPS cae mucho en la Pi se
+        # puede desactivar con SOMNO_REFINE_LANDMARKS=0.
+        self.refine_landmarks = os.getenv("SOMNO_REFINE_LANDMARKS", "1").strip().lower() in ("1", "true", "yes", "on")
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            refine_landmarks=False,
+            refine_landmarks=self.refine_landmarks,
             max_num_faces=1,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -264,22 +370,29 @@ class SomnolenciaSystem:
 
     @staticmethod
     def _try_open_camera(index: int | str) -> cv2.VideoCapture | None:
-        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        if not cap.isOpened():
+        # Bajo el shim V4L2 de libcamera (libcamerify) OpenCV entrega un buffer
+        # plano (1, W*H*3) si no se fija el fourcc; YUYV fuerza la negociacion a
+        # BGR de 3 canales. Se deja el intento sin fourcc como respaldo para
+        # camaras USB que solo exponen MJPG.
+        for fourcc in ("YUYV", None):
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(index)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            if fourcc is not None:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, SomnolenciaSystem.CAPTURE_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SomnolenciaSystem.CAPTURE_HEIGHT)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            for _ in range(30):
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.ndim == 3:
+                    return cap
+                time.sleep(0.1)
             cap.release()
-            cap = cv2.VideoCapture(index)
-        if not cap.isOpened():
-            cap.release()
-            return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, SomnolenciaSystem.CAPTURE_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SomnolenciaSystem.CAPTURE_HEIGHT)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        for _ in range(10):
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                return cap
-            time.sleep(0.05)
-        cap.release()
         return None
 
     @staticmethod
@@ -341,15 +454,37 @@ class SomnolenciaSystem:
 
     @staticmethod
     def _build_mediapipe_frame(frame: np.ndarray) -> np.ndarray:
-        # Optimiza costo de inferencia sin recortar: solo escala manteniendo 16:9.
-        if frame.shape[1] == SomnolenciaSystem.MP_PROC_WIDTH and frame.shape[0] == SomnolenciaSystem.MP_PROC_HEIGHT:
+        # Escala PRESERVANDO la relacion de aspecto (lado mayor -> MP_PROC_LONG).
+        # Estirar el frame distorsiona toda la geometria facial y la pose.
+        h, w = frame.shape[:2]
+        long_side = max(w, h)
+        target = SomnolenciaSystem.MP_PROC_LONG
+        if long_side <= target:
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(
-            frame,
-            (SomnolenciaSystem.MP_PROC_WIDTH, SomnolenciaSystem.MP_PROC_HEIGHT),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        scale = float(target) / float(long_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         return cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+    # Landmarks del contorno del rostro para acotar el recuadro de la cara.
+    _FACE_BOX_IDX = (10, 152, 234, 454, 33, 263, 61, 291)
+
+    @staticmethod
+    def _face_illumination(mp_frame: np.ndarray, lm, mp_w: int, mp_h: int) -> float:
+        """Brillo medio (0-1) del RECUADRO de la cara, no de todo el frame.
+
+        La media global se hunde con un fondo oscuro aunque la cara este bien
+        iluminada; medir solo la region facial refleja la luz real sobre el rostro.
+        """
+        xs = [lm[i].x for i in SomnolenciaSystem._FACE_BOX_IDX]
+        ys = [lm[i].y for i in SomnolenciaSystem._FACE_BOX_IDX]
+        x0 = max(0, int(min(xs) * mp_w)); x1 = min(mp_w, int(max(xs) * mp_w) + 1)
+        y0 = max(0, int(min(ys) * mp_h)); y1 = min(mp_h, int(max(ys) * mp_h) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        crop = mp_frame[y0:y1, x0:x1]
+        return float(crop.mean()) / 255.0 if crop.size else 0.0
 
     @staticmethod
     def _iso_ts(ts: float) -> str:
@@ -459,6 +594,22 @@ class SomnolenciaSystem:
         state.last_score_state_persist = ts
         state.last_score_state_value = score_value
 
+    def _finalize_calibration(self) -> None:
+        """Cierra la calibracion: valida/clampea baselines y los persiste."""
+        corrected = self.calibration.sanitize()
+        self.calibration.calibrated = True
+        if corrected:
+            print(f"[CALIB] Baseline sospechoso, campos clampeados: {', '.join(corrected)}")
+        try:
+            self.calibration_store.save(self.calibration.snapshot())
+        except Exception as exc:  # no debe tumbar el sistema por un fallo de IO
+            print(f"[WARN] No se pudo guardar la calibracion: {exc}")
+        print(
+            "[CALIB] Calibracion completada y guardada "
+            f"ear={self.calibration.ear_baseline:.3f} mar={self.calibration.mar_baseline:.3f} "
+            f"pitch0={self.calibration.pitch_neutral:.1f} yaw0={self.calibration.yaw_neutral:.1f}"
+        )
+
     def _append_minute_sample(self, ts: float, param_outputs: list[dict], score_out: dict) -> None:
         self._minute_samples.append(
             {
@@ -564,12 +715,20 @@ class SomnolenciaSystem:
         self.supabase.stop()
         self.buzzer.stop()
         self.face_mesh.close()
+        # Persistir la calibracion vigente al apagar (si ya estaba calibrado)
+        # para no perder el ajuste del conductor.
+        if self.calibration.calibrated:
+            try:
+                self.calibration_store.save(self.calibration.snapshot())
+            except Exception:
+                pass
+        self.calibration_store.close()
         self.score_state_store.close()
         self.event_store.close()
 
     def run(self) -> None:
         preferred = int(self.cfg.camera_index)
-        print(f"[INFO] MP resolucion={self.MP_PROC_WIDTH}x{self.MP_PROC_HEIGHT} | manos={'ON' if self.hands_enabled else 'OFF'} | display={'ON' if self.display_enabled else 'OFF'}")
+        print(f"[INFO] MP lado_mayor={self.MP_PROC_LONG} (aspecto preservado) | manos={'ON' if self.hands_enabled else 'OFF'} | display={'ON' if self.display_enabled else 'OFF'}")
         print(f"[INFO] Abriendo camara (index preferido={preferred})...")
         camera_kind = ""
         camera = None
@@ -602,6 +761,7 @@ class SomnolenciaSystem:
         print("[INFO] Esperando primer frame...")
 
         state = RuntimeState(session_id=f"ses_{uuid.uuid4().hex[:12]}", started_at=time.time(), last_minute_flush=time.time())
+        self.recorder = SessionRecorder(state.session_id)
 
         # SIGTERM (systemd stop, kill) debe disparar shutdown limpio.
         def _sigterm_handler(_signum, _frame):
@@ -667,15 +827,28 @@ class SomnolenciaSystem:
                 param_outputs = []
                 pitch = yaw = roll = 0.0
                 ear = mar = 0.0
+                yaw_delta = pitch_delta_head = roll_delta = 0.0
+                ocular_reliable = mouth_reliable = False
+                off_road = False
+                distraction_s = 0.0
+                distraction_flag = False
                 fixation_value = 0.0
+                asym_value = 0.0
                 face_detected = False
+                # Iluminacion: por defecto la global (respaldo si no hay cara).
+                # Si hay rostro se recalcula sobre el recuadro de la cara.
+                illumination_now = float(mp_frame.mean()) / 255.0
+                face_illumination = illumination_now
+                light_ok = illumination_now >= self.min_illumination
 
                 if face_out.multi_face_landmarks:
                     face_detected = True
                     lm = face_out.multi_face_landmarks[0].landmark
-                    ear_left = get_ear(lm, OJO_IZQ, mp_w, mp_h, self.rotation_index)
-                    ear_right = get_ear(lm, OJO_DER, mp_w, mp_h, self.rotation_index)
-                    ear = (ear_left + ear_right) * 0.5
+                    # Luz REAL sobre la cara (recuadro facial), no del fondo.
+                    face_illumination = self._face_illumination(mp_frame, lm, mp_w, mp_h)
+                    light_ok = face_illumination >= self.min_illumination
+                    ear_left, w_eye_left = eye_metrics(lm, OJO_IZQ, mp_w, mp_h, self.rotation_index)
+                    ear_right, w_eye_right = eye_metrics(lm, OJO_DER, mp_w, mp_h, self.rotation_index)
                     mar = get_mar(lm, BOCA, mp_w, mp_h, self.rotation_index)
 
                     left_pts = []
@@ -712,12 +885,60 @@ class SomnolenciaSystem:
                     yaw = out_cabeza["YAW"]["value"]
                     roll = out_cabeza["ROLL"]["value"]
 
-                    out_ojos = self.ojos.update(ts, ear, left_center, right_center, self.calibration)
-                    out_boca = self.boca.update(ts, mar, self.calibration)
+                    # Desviaciones de pose respecto al neutro (diferencia angular
+                    # MAS CORTA: robusta al wraparound de ±180 de solvePnP).
+                    yaw_delta = angle_delta_deg(yaw, self.calibration.yaw_neutral)
+                    pitch_delta_head = angle_delta_deg(pitch, self.calibration.pitch_neutral)
+                    roll_delta = angle_delta_deg(roll, self.calibration.roll_neutral)
+
+                    # EAR fusionado con conciencia de pose: de frente promedia
+                    # ambos ojos; al girar pondera hacia el ojo mas frontal.
+                    ear = fuse_ear(
+                        ear_left, w_eye_left, ear_right, w_eye_right, yaw_delta,
+                        yaw_soft=self.ear_yaw_soft, yaw_hard=self.ear_yaw_hard,
+                    )
+
+                    # Fiabilidad geometrica de cada grupo segun cuanto se escorza
+                    # la cara Y si hay luz suficiente. Fuera de rango o en casi
+                    # oscuridad, se suprimen los eventos de ese grupo.
+                    ocular_reliable = (
+                        light_ok
+                        and abs(yaw_delta) <= self.yaw_ocular_max
+                        and abs(pitch_delta_head) <= self.pitch_ocular_max
+                        and abs(roll_delta) <= self.roll_ocular_max
+                    )
+                    mouth_reliable = (
+                        light_ok
+                        and abs(yaw_delta) <= self.yaw_mouth_max
+                        and abs(pitch_delta_head) <= self.pitch_mouth_max
+                    )
+
+                    # Distraccion: giro (yaw) sostenido = mirada fuera de via. No
+                    # es fatiga (no toca el score), pero se marca como senal.
+                    if self.distraction_enabled and abs(yaw_delta) >= self.distraction_yaw:
+                        if self._distraction_since is None:
+                            self._distraction_since = ts
+                        distraction_s = max(0.0, ts - self._distraction_since)
+                        off_road = True
+                    else:
+                        self._distraction_since = None
+                        self._distraction_reported = False
+                    distraction_flag = self.distraction_enabled and distraction_s >= self.distraction_min_s
+                    if distraction_flag and not self._distraction_reported:
+                        self._distraction_reported = True
+                        print(f"[DISTRACCION] mirada fuera de via {distraction_s:.1f}s (yaw={yaw_delta:.0f} deg)")
+                    # Aviso audible con re-chirp mientras persista la distraccion.
+                    if distraction_flag and self.distraction_buzzer and (ts - self._distraction_last_chirp) >= self.distraction_rechirp_s:
+                        self.buzzer.chirp(beeps=2, on_s=0.05, off_s=0.05)
+                        self._distraction_last_chirp = ts
+
+                    out_ojos = self.ojos.update(ts, ear, left_center, right_center, self.calibration, pose_reliable=ocular_reliable)
+                    out_boca = self.boca.update(ts, mar, self.calibration, pose_reliable=mouth_reliable)
                     out_facial = self.facial.update(ts, lm, mp_w, mp_h, self.calibration, self.rotation_index)
                     out_manos = self.manos.update(ts, hand_out, left_center, right_center, mp_w, mp_h, self.calibration, self.rotation_index)
 
                     fixation_value = out_ojos["FIXATION"]["value"]
+                    asym_value = out_facial["FACIAL_ASYMMETRY"]["value"]
 
                     param_outputs.extend([v for k, v in out_ojos.items() if k != "blink_detected"])
                     param_outputs.extend(list(out_boca.values()))
@@ -731,15 +952,30 @@ class SomnolenciaSystem:
 
                 if not self.calibration.calibrated:
                     elapsed = ts - state.started_at
-                    self.calibration.ear_baseline = 0.995 * self.calibration.ear_baseline + 0.005 * max(ear, 0.01)
-                    self.calibration.mar_baseline = 0.995 * self.calibration.mar_baseline + 0.005 * max(mar, 0.01)
                     if face_detected:
-                        self.calibration.pitch_neutral = 0.99 * self.calibration.pitch_neutral + 0.01 * pitch
-                        self.calibration.roll_neutral = 0.99 * self.calibration.roll_neutral + 0.01 * roll
-                        self.calibration.yaw_neutral = 0.99 * self.calibration.yaw_neutral + 0.01 * yaw
+                        # Pose neutra: media CIRCULAR (solo requiere rostro; la pose
+                        # por solvePnP es robusta a la luz). El pitch/roll crudos
+                        # rondan ±180 y saltan el wraparound; la media circular da
+                        # el neutro correcto donde una EMA lineal daba basura.
+                        self.calibration.pitch_neutral = self._pitch_mean.update(pitch)
+                        self.calibration.roll_neutral = self._roll_mean.update(roll)
+                        self.calibration.yaw_neutral = self._yaw_mean.update(yaw)
+                        # EAR/MAR/asimetria son sensibles al ruido: solo con luz
+                        # suficiente y rechazando outliers por PLAUSIBILIDAD (un
+                        # parpadeo/bostezo no debe sesgar el baseline).
+                        if light_ok:
+                            # EAR: solo ojo abierto (descarta parpadeos, ~0.75*baseline).
+                            if 0.12 <= ear <= 0.45 and ear >= 0.75 * self.calibration.ear_baseline:
+                                self.calibration.ear_baseline = 0.99 * self.calibration.ear_baseline + 0.01 * ear
+                            # MAR: solo boca cerrada (descarta bostezos/habla).
+                            if 0.05 <= mar <= self.calibration.mar_baseline * 1.3:
+                                self.calibration.mar_baseline = 0.99 * self.calibration.mar_baseline + 0.01 * mar
+                            # Asimetria facial de reposo del conductor (descarta ruido).
+                            if 0.0 < asym_value < 0.30:
+                                self.calibration.asymmetry_base = 0.99 * self.calibration.asymmetry_base + 0.01 * asym_value
                     calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "300"))
                     if elapsed >= calibration_seconds:
-                        self.calibration.calibrated = True
+                        self._finalize_calibration()
 
                 for p in param_outputs:
                     self.event_store.append(p)
@@ -747,17 +983,72 @@ class SomnolenciaSystem:
                 rules = self.rule_engine.latest()
                 score_forced_min_level = rules.get("forced_min_level", 0) if face_detected else 0
                 score_forced_reasons = rules.get("reasons", []) if face_detected else []
+                # Gate de calidad de rostro: MediaPipe a veces detecta un "rostro"
+                # espurio en texturas (p.ej. una pared), lo que disparaba falsos
+                # positivos. Solo se considera rostro valido si la deteccion es
+                # estable (LANDMARK_STABILITY alto). Umbral configurable.
+                landmark_stability = float(self._param_value(param_outputs, "LANDMARK_STABILITY", 0.0)) if face_detected else 0.0
+                face_quality_ok = face_detected and landmark_stability >= self.face_quality_min
+                score_forced_min_level = score_forced_min_level if face_quality_ok else 0
+                score_forced_reasons = score_forced_reasons if face_quality_ok else []
+
                 score_out = self.score.update(
                     ts=ts,
-                    param_outputs=param_outputs if face_detected else [],
+                    param_outputs=param_outputs if face_quality_ok else [],
                     vehicle_moving=True,
                     driver_response=False,
                     forced_min_level=score_forced_min_level,
                     forced_reasons=score_forced_reasons,
-                    sensor_valid=face_detected,
+                    sensor_valid=face_quality_ok,
                 )
 
-                pitch_delta = pitch - self.calibration.pitch_neutral
+                # Ventana de gracia ante perdida breve de rostro: si la cara acaba
+                # de desaparecer, congelamos el nivel comprometido (histeresis) en
+                # lugar de dejarlo caer. Asi, quitar la cara y volver a ponerla en
+                # unos segundos no reinicia la deteccion.
+                if face_quality_ok:
+                    self._face_lost_since = None
+                    face_in_grace = False
+                else:
+                    if self._face_lost_since is None:
+                        self._face_lost_since = ts
+                    face_in_grace = (ts - self._face_lost_since) <= self.face_grace_s
+
+                # Endurecimiento de precision: corroboracion multi-cue + persistencia
+                # temporal + histeresis sobre el nivel crudo del score.
+                active_event_params = [
+                    str(p.get("paramid")) for p in param_outputs
+                    if bool(p.get("eventflag", False)) and p.get("paramid")
+                ] if face_quality_ok else []
+                if face_in_grace:
+                    # Congelar la histeresis: mantener el ultimo nivel comprometido
+                    # sin actualizar el estabilizador (no alimentar raw_level=0).
+                    frozen = int(self.level_stabilizer.committed_level)
+                    stab = {
+                        "committed_level": frozen,
+                        "raw_level": frozen,
+                        "corroborated": True,
+                        "active_families": [],
+                    }
+                else:
+                    stab = self.level_stabilizer.update(
+                        ts=ts,
+                        raw_level=int(score_out["level"]),
+                        active_event_params=active_event_params,
+                        forced_min_level=int(score_forced_min_level),
+                    )
+                committed_level = int(stab["committed_level"])
+                score_out = {
+                    **score_out,
+                    "level": committed_level,
+                    "label": self.score.level_label(committed_level),
+                    "raw_level": int(stab["raw_level"]),
+                    "corroborated": bool(stab["corroborated"]),
+                    "active_families": stab["active_families"],
+                    "landmark_stability": round(landmark_stability, 3),
+                }
+
+                pitch_delta = angle_delta_deg(pitch, self.calibration.pitch_neutral)
                 head_down_now = face_detected and (pitch_delta <= -24.0)
                 if head_down_now:
                     if head_down_start_ts is None:
@@ -768,25 +1059,40 @@ class SomnolenciaSystem:
                     head_down_s = 0.0
                 pv = {p["paramid"]: p["value"] for p in param_outputs if "paramid" in p}
                 eye_closed_ms = float(pv.get("EYE_CLOSED_MS", 0.0))
-                emergency = detect_emergency(
-                    {
-                        "blink_tc_ms": pv.get("BLINK_TC", 0.0),
-                        "eye_closed_ms": eye_closed_ms,
-                        "pitch": pitch,
-                        "pitch_delta": pitch_delta,
-                        "roll": roll,
-                        "yaw": yaw,
-                        "head_micro_osc": pv.get("HEAD_MICRO_OSC", 0.0),
-                        "landmark_stability": pv.get("LANDMARK_STABILITY", 1.0),
-                        "facial_asymmetry": pv.get("FACIAL_ASYMMETRY", 0.0),
-                        "fixation": fixation_value,
-                        "blink_fb": pv.get("BLINK_FB", 0.0),
-                        "face_out": not face_detected,
-                        "yaw_justified": abs(yaw) >= 30.0,
-                        "head_down_s": head_down_s,
-                    }
-                )
-                if eye_closed_ms >= 1500.0 and int(score_out.get("level", 0)) < 2:
+                # La emergencia medica solo se evalua con un rostro CONFIABLE. Un
+                # rostro espurio/inestable (textura de fondo) no debe disparar
+                # "perdida de consciencia" ni "ictus". La ausencia total de rostro
+                # se sigue reportando como FACE_OUT_OF_FRAME.
+                if face_quality_ok:
+                    emergency = detect_emergency(
+                        {
+                            "blink_tc_ms": pv.get("BLINK_TC", 0.0),
+                            "eye_closed_ms": eye_closed_ms,
+                            "pitch": pitch,
+                            "pitch_delta": pitch_delta,
+                            "roll": roll,
+                            "yaw": yaw,
+                            "head_micro_osc": pv.get("HEAD_MICRO_OSC", 0.0),
+                            "landmark_stability": pv.get("LANDMARK_STABILITY", 1.0),
+                            # Solo se considera asimetria (ictus) con cara frontal
+                            # fiable; y con umbral CALIBRADO al conductor, no fijo.
+                            "facial_asymmetry": pv.get("FACIAL_ASYMMETRY", 0.0) if ocular_reliable else 0.0,
+                            "asymmetry_thr": max(0.20, self.calibration.asymmetry_base * 3.0),
+                            "fixation": fixation_value,
+                            "blink_fb": pv.get("BLINK_FB", 0.0),
+                            "face_out": False,
+                            "yaw_justified": abs(yaw) >= 30.0,
+                            "head_down_s": head_down_s,
+                        }
+                    )
+                elif not face_detected:
+                    emergency = detect_emergency(
+                        {"pitch_delta": pitch_delta, "head_down_s": head_down_s,
+                         "face_out": True, "yaw_justified": False}
+                    )
+                else:
+                    emergency = {"emergencyflag": False, "emergencytype": None, "reasons": [], "fixedbuzzer": False}
+                if face_quality_ok and eye_closed_ms >= 1500.0 and int(score_out.get("level", 0)) < 2:
                     reasons = list(score_out.get("reasons", []))
                     if "EYE_CLOSED_MS_FAST" not in reasons:
                         reasons.append("EYE_CLOSED_MS_FAST")
@@ -815,6 +1121,45 @@ class SomnolenciaSystem:
                     "session_id": state.session_id,
                     "score": score_out,
                     "alerts": {"active": score_out["level"] > 0, "level": score_out["level"], "reasons": score_out.get("reasons", [])},
+                    # Bloque de trazabilidad de la decision de somnolencia. Sirve
+                    # para auditar precision en el arnes de validacion: por que se
+                    # comprometio (o no) un nivel. Compatible hacia atras: 'score'
+                    # y 'alerts' se mantienen intactos.
+                    "drowsiness": {
+                        "committed_level": int(score_out["level"]),
+                        "raw_level": int(score_out.get("raw_level", score_out["level"])),
+                        "corroborated": bool(score_out.get("corroborated", True)),
+                        "active_families": score_out.get("active_families", []),
+                        "fatigue_score": int(score_out.get("fatigue_score", 0)),
+                        "face_quality_ok": bool(face_quality_ok),
+                        "landmark_stability": float(score_out.get("landmark_stability", 0.0)),
+                        "active_events": active_event_params,
+                        # Trazabilidad de pose: permite auditar supresiones por giro.
+                        "pose": {
+                            "yaw_delta": round(float(yaw_delta), 1),
+                            "pitch_delta": round(float(pitch_delta_head), 1),
+                            "roll_delta": round(float(roll_delta), 1),
+                            "ocular_reliable": bool(ocular_reliable),
+                            "mouth_reliable": bool(mouth_reliable),
+                            "face_illumination": round(float(face_illumination), 3),
+                            "light_ok": bool(light_ok),
+                        },
+                        # Valores crudos oculares/boca para auditar falsos cierres.
+                        "raw": {
+                            "ear": round(float(pv.get("EAR", 0.0)), 3),
+                            "mar": round(float(pv.get("MAR", 0.0)), 3),
+                            "blink_tc_ms": round(float(pv.get("BLINK_TC", 0.0)), 0),
+                            "eye_closed_ms": round(float(pv.get("EYE_CLOSED_MS", 0.0)), 0),
+                            "perclos": round(float(pv.get("PERCLOS", 0.0)), 3),
+                        },
+                        # Distraccion (mirada fuera de via): senal independiente de
+                        # la fatiga; util para auditar atencion, no altera el nivel.
+                        "distraction": {
+                            "off_road": bool(off_road),
+                            "sustained": bool(distraction_flag),
+                            "duration_s": round(float(distraction_s), 1),
+                        },
+                    },
                     "emergency": emergency,
                     "alert_memory": alert_memory,
                     "sys": {
@@ -835,6 +1180,7 @@ class SomnolenciaSystem:
                     fixed_buzzer=bool(emergency.get("fixedbuzzer", False)),
                 )
 
+                self.recorder.append(ts, build_record(ts, telemetry, pv))
                 self._append_minute_sample(ts, param_outputs, score_out)
                 if state.last_session_sync == 0.0 or (ts - state.last_session_sync) >= 15.0:
                     self._sync_session(state, ts, score_out, is_final=False)
@@ -869,6 +1215,8 @@ class SomnolenciaSystem:
 
         finally:
             shutdown_ts = time.time()
+            if getattr(self, "recorder", None) is not None:
+                self.recorder.close()
             self.score_state_store.save(self.score.snapshot(), ts=shutdown_ts)
             self._flush_minute_summary(state, shutdown_ts, last_telemetry, force=True)
             self._sync_session(state, shutdown_ts, last_score_out, is_final=True)

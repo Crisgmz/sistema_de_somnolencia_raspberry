@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List
 
 HEAD_DOWN_THRESHOLD_DEG = 24.0
-EYE_CLOSED_EMERGENCY_MS = 2000.0
+
+
+def _env_f(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Ojos cerrados de forma continua >= este umbral => alarma (buzzer) a los 2 s.
+EYE_CLOSED_EMERGENCY_MS = _env_f("SOMNO_EYE_CLOSED_EMERGENCY_MS", 2000.0)
 HEAD_DOWN_FIXED_BUZZER_S = 6.0
 
 
@@ -20,6 +31,8 @@ def detect_emergency(metrics: Dict) -> Dict:
     reasons: List[str] = []
     if eye_closed_ms >= EYE_CLOSED_EMERGENCY_MS:
         reasons.append("LOSS_OF_CONSCIOUSNESS")
+        # Ojos cerrados >=2s: buzzer FIJO (continuo), no intermitente.
+        fixed_buzzer = True
     if head_down and head_down_s >= HEAD_DOWN_FIXED_BUZZER_S:
         reasons.append("PROLONGED_HEAD_DOWN")
         fixed_buzzer = True
@@ -35,7 +48,8 @@ def detect_emergency(metrics: Dict) -> Dict:
 
     if float(metrics.get("head_micro_osc", 0.0)) >= 0.45 and float(metrics.get("landmark_stability", 1.0)) <= 0.35:
         reasons.append("CONVULSIVE_PATTERN")
-    if float(metrics.get("facial_asymmetry", 0.0)) >= 0.09:
+    stroke_thr = float(metrics.get("asymmetry_thr", 0.09))
+    if float(metrics.get("facial_asymmetry", 0.0)) >= stroke_thr:
         reasons.append("STROKE_PATTERN")
     if abs(float(metrics.get("roll", 0.0))) >= 45.0 and abs(float(metrics.get("yaw", 0.0))) >= 30.0:
         reasons.append("LATERAL_COLLAPSE")

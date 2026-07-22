@@ -13,13 +13,17 @@ BOCA = [61, 291, 0, 17, 84, 314, 405, 321]
 POSE_IDX = [1, 152, 33, 263, 61, 291]
 
 
-def get_ear(landmarks, points, w, h, rotation_index=0):
+def _clamp01(v):
+    return max(0.0, min(1.0, float(v)))
+
+
+def _eye_coords(landmarks, points, w, h, rotation_index=0):
     coords = []
     for i in points:
         lm = landmarks[i]
         x = lm.x * w
         y = lm.y * h
-        
+
         # Ajustar coordenadas según rotación para que sean equivalentes al sistema original
         if rotation_index == 1:  # 90 grados horario
             x, y = y, w - x
@@ -27,13 +31,50 @@ def get_ear(landmarks, points, w, h, rotation_index=0):
             x, y = w - x, h - y
         elif rotation_index == 3:  # 90 grados antihorario (270 grados horario)
             x, y = h - y, x
-            
+
         coords.append(np.array([x, y]))
-    
-    p2_p6 = dist.euclidean(coords[1], coords[5])
-    p3_p5 = dist.euclidean(coords[2], coords[4])
-    p1_p4 = dist.euclidean(coords[0], coords[3])
-    return (p2_p6 + p3_p5) / (2.0 * p1_p4) if p1_p4 > 0 else 0.0
+    return coords
+
+
+def eye_metrics(landmarks, points, w, h, rotation_index=0):
+    """Devuelve (EAR, ancho_horizontal_px) de un ojo.
+
+    El ancho horizontal p1-p4 (comisura a comisura) es la referencia que menos
+    se escorza de frente y la que MAS se acorta cuando el ojo se aleja de la
+    camara por giro (yaw). Sirve para elegir el ojo mas frontal (fiable).
+    """
+    c = _eye_coords(landmarks, points, w, h, rotation_index)
+    p2_p6 = dist.euclidean(c[1], c[5])
+    p3_p5 = dist.euclidean(c[2], c[4])
+    p1_p4 = dist.euclidean(c[0], c[3])
+    ear = (p2_p6 + p3_p5) / (2.0 * p1_p4) if p1_p4 > 0 else 0.0
+    return ear, float(p1_p4)
+
+
+def fuse_ear(ear_left, w_left, ear_right, w_right, yaw_delta_deg,
+             yaw_soft=12.0, yaw_hard=30.0):
+    """Combina el EAR de ambos ojos segun el giro de la cabeza (yaw).
+
+    - De frente (|yaw| <= yaw_soft): promedio de ambos ojos (ambos fiables).
+    - En giro: se pondera progresivamente hacia el ojo mas FRONTAL, identificado
+      por el mayor ancho horizontal proyectado (el que menos se escorza). El ojo
+      que se aleja de la camara pierde fiabilidad (auto-oclusion por la nariz,
+      landmarks ruidosos) y se le baja el peso hasta 0 en |yaw| >= yaw_hard.
+    """
+    ay = abs(float(yaw_delta_deg))
+    if ay <= yaw_soft:
+        return 0.5 * (ear_left + ear_right)
+    if w_left >= w_right:
+        near, far = float(ear_left), float(ear_right)
+    else:
+        near, far = float(ear_right), float(ear_left)
+    t = _clamp01((ay - yaw_soft) / max(1e-6, yaw_hard - yaw_soft))
+    w_near = 0.5 + 0.5 * t
+    return w_near * near + (1.0 - w_near) * far
+
+
+def get_ear(landmarks, points, w, h, rotation_index=0):
+    return eye_metrics(landmarks, points, w, h, rotation_index)[0]
 
 
 def get_mar(landmarks, points, w, h, rotation_index=0):

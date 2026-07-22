@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from core.calibration import Calibration
-from core.common_types import build_param_output, normalize_linear
+from core.common_types import angle_delta_deg, build_param_output, normalize_linear
 
 POSE_IDX = [1, 152, 33, 263, 61, 291]
 MODEL_POINTS = np.array(
@@ -47,6 +47,11 @@ class CabezaParametros:
         self.recovery_start_ts: Optional[float] = None
         self.last_recovery = 0.0
         self.pitch_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)
+        # Semilla temporal para solvePnP: reutilizar la pose previa estabiliza la
+        # solucion (menos saltos/ambiguedad frame a frame) y por tanto reduce
+        # falsos picos de velocidad de caida y micro-oscilacion.
+        self._rvec: Optional[np.ndarray] = None
+        self._tvec: Optional[np.ndarray] = None
 
     def _pose(self, landmarks: Sequence, frame_w: int, frame_h: int, rotation_index: int = 0) -> Tuple[float, float, float]:
         image_points = []
@@ -66,9 +71,20 @@ class CabezaParametros:
         
         image_points = np.asarray(image_points, dtype=np.float64)
         camera_matrix = np.asarray([[frame_w, 0, frame_w / 2.0], [0, frame_w, frame_h / 2.0], [0, 0, 1]], dtype=np.float64)
-        ok, rvec, _ = cv2.solvePnP(MODEL_POINTS, image_points, camera_matrix, np.zeros((4, 1), dtype=np.float64), flags=cv2.SOLVEPNP_ITERATIVE)
+        use_guess = self._rvec is not None and self._tvec is not None
+        ok, rvec, tvec = cv2.solvePnP(
+            MODEL_POINTS,
+            image_points,
+            camera_matrix,
+            np.zeros((4, 1), dtype=np.float64),
+            rvec=self._rvec.copy() if use_guess else None,
+            tvec=self._tvec.copy() if use_guess else None,
+            useExtrinsicGuess=use_guess,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
         if not ok:
             return 0.0, 0.0, 0.0
+        self._rvec, self._tvec = rvec, tvec
         rot_matrix, _ = cv2.Rodrigues(rvec)
         return _rotation_to_euler_deg(rot_matrix)
 
@@ -76,11 +92,12 @@ class CabezaParametros:
         pitch, yaw, roll = self._pose(landmarks, frame_w, frame_h, rotation_index)
         velocity = 0.0
         if self.prev_pitch is not None and self.prev_ts is not None:
-            velocity = (pitch - self.prev_pitch) / max(1e-3, ts - self.prev_ts)
+            # Diferencia circular: evita picos espurios por el wraparound ±180.
+            velocity = angle_delta_deg(pitch, self.prev_pitch) / max(1e-3, ts - self.prev_ts)
         self.prev_pitch = pitch
         self.prev_ts = ts
 
-        pitch_delta = pitch - calibration.pitch_neutral
+        pitch_delta = angle_delta_deg(pitch, calibration.pitch_neutral)
         if pitch_delta >= 24.0 and not self.recovery_active:
             self.recovery_active = True
             self.recovery_start_ts = ts
@@ -108,8 +125,8 @@ class CabezaParametros:
 
         return {
             "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
-            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(roll - calibration.roll_neutral), 12.0, 40.0), calibration.calibrated and abs(roll - calibration.roll_neutral) >= 32.0, 4, ts=ts),
-            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(yaw - calibration.yaw_neutral), 15.0, 45.0), calibration.calibrated and abs(yaw - calibration.yaw_neutral) >= 40.0, 2, ts=ts),
+            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), calibration.calibrated and abs(angle_delta_deg(roll, calibration.roll_neutral)) >= 32.0, 4, ts=ts),
+            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), calibration.calibrated and abs(angle_delta_deg(yaw, calibration.yaw_neutral)) >= 40.0, 2, ts=ts),
             "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and velocity >= 25.0, 6, ts=ts),
             "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), calibration.calibrated and self.last_recovery >= 2.3, 5, ts=ts),
             "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.3, 0.8), calibration.calibrated and micro_value >= 0.55, 0, ts=ts),

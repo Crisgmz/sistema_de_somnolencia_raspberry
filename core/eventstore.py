@@ -6,6 +6,7 @@ from collections import deque
 import json
 import sqlite3
 import threading
+import time
 from typing import Deque, Dict, Iterable, List
 
 
@@ -15,6 +16,10 @@ class EventStore:
         self._lock = threading.Lock()
         self._active_params: set[str] = set()
         self.retention_seconds = float(retention_seconds)
+        # Inicio de la sesion: las ventanas del RuleEngine NO deben contar eventos
+        # de sesiones anteriores (un reinicio no debe heredar cues viejos, p.ej.
+        # de un run con bug, que dispararian reglas de fatiga al arrancar).
+        self.session_start_ts = time.time()
         self.conn: sqlite3.Connection | None = None
         if db_path:
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -61,7 +66,9 @@ class EventStore:
             self.append(event)
 
     def window(self, now_ts: float, window_seconds: float) -> List[Dict]:
-        start_ts = float(now_ts) - float(window_seconds)
+        # Acotar el inicio de la ventana al arranque de la sesion: nunca se
+        # consideran eventos previos al reinicio actual.
+        start_ts = max(float(now_ts) - float(window_seconds), self.session_start_ts)
         if self.conn:
             with self._lock:
                 rows = self.conn.execute(
