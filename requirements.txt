@@ -1,0 +1,52 @@
+# Sistema de deteccion de somnolencia - Raspberry Pi 5 (Debian 13 trixie, aarch64)
+#
+# IMPORTANTE: requiere Python 3.12, NO 3.13.
+# MediaPipe no publica wheel para Linux aarch64 en cp313; el ultimo disponible
+# es 0.10.18-cp312. El Python del sistema en trixie es 3.13, por lo que el
+# entorno se crea con un interprete 3.12 aparte:
+#
+#   uv python install 3.12
+#   uv venv --python 3.12 .venv
+#   uv pip install -r requirements.txt
+#
+# EJECUTAR:  ./run.sh        (usa .venv/bin/python; NO uses `python3 main.py`)
+#   No se necesita libcamerify: picamera2 habla con libcamera directamente.
+
+# Vision y calculo
+mediapipe==0.10.18
+opencv-python==4.11.0.86
+numpy==1.26.4
+scipy==1.17.1
+
+# Configuracion
+python-dotenv==1.2.2
+
+# Telemetria y persistencia
+paho-mqtt==2.1.0
+supabase==2.31.0
+
+# GPIO del buzzer. En Pi 5 el RPi.GPIO clasico no funciona; rpi-lgpio
+# provee el modulo RPi.GPIO sobre lgpio.
+rpi-lgpio==0.6
+
+# -------------------------------------------------------------------------
+# Camara (picamera2 con autofoco/AWB) - se instala APARTE de este archivo.
+# picamera2 necesita los bindings de Python de libcamera, que NO existen en
+# pip para aarch64/py3.12. Se compilan contra la libcamera del sistema
+# (v0.7.1+rpt20260609) con el helper del repo:
+#
+#   sudo apt install -y libcamera-dev libcap-dev
+#   uv pip install --python .venv/bin/python \
+#     --config-settings=setup-args="-Drepository=https://github.com/raspberrypi/libcamera.git" \
+#     --config-settings=setup-args="-Drevision=v0.7.1+rpt20260609" \
+#     --config-settings=setup-args="-Dversion=unknown" \
+#     --config-settings=setup-args="-Dpatch=v071" \
+#     --config-settings=setup-args="-Dwerror=false" \
+#     ./build_pylibcamera
+#   uv pip install --python .venv/bin/python picamera2==0.3.36
+#
+# Nota: picamera2 importa 'pykms' (preview DRM/KMS) que este proyecto no usa;
+# hay un stub en .venv/.../site-packages/pykms.py para satisfacer ese import
+# sin compilar kms++ (incompatible con los headers del sistema).
+# picamera2==0.3.36
+# rpi-libcamera==0.1a10  (desde ./build_pylibcamera)

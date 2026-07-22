@@ -1,0 +1,18 @@
+diff --git a/src/py/libcamera/meson.build b/src/py/libcamera/meson.build
+index 6c3b66b..ec0e1bb 100644
+--- a/src/py/libcamera/meson.build
++++ b/src/py/libcamera/meson.build
+@@ -58,6 +58,13 @@ pycamera_args = [
+     '-DPYBIND11_USE_SMART_HOLDER_AS_DEFAULT',
+ ]
+ 
++# --- rpi-libcamera (adaptado a v0.7.1): construir solo bindings, enlazar
++# contra la libcamera-dev instalada. El meson.build externo compila el
++# modulo con los include_directories correctos. ---
++pycamera_args += ['-DLIBCAMERA_BASE_PRIVATE']
++
++subdir_done()
++
+ if meson.is_cross_build()
+     # Meson doesn't correctly support cross-compilation through the python
+     # module. There's work in progress to fix this, based on PEP 739

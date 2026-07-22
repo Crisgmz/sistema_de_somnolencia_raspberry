@@ -36,6 +36,10 @@ class Buzzer:
         self._level = 0
         self._continuous = False
         self._last_logged_level = -1
+        # Chirp one-shot (p.ej. distraccion): patron breve y distinto del de
+        # fatiga que se reproduce una vez y luego vuelve al modo por nivel.
+        self._chirp_lock = threading.Lock()
+        self._chirp: Tuple[int, float, float] | None = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
         if self.enabled:
             try:
@@ -71,8 +75,30 @@ class Buzzer:
             print(f"[BUZZER] Modo fijo {'ON' if new_mode else 'OFF'}")
         self._continuous = new_mode
 
+    def chirp(self, beeps: int = 2, on_s: float = 0.05, off_s: float = 0.05) -> None:
+        """Solicita un patron breve one-shot (no altera el nivel de fatiga)."""
+        with self._chirp_lock:
+            self._chirp = (max(1, int(beeps)), float(on_s), float(off_s))
+
+    def _take_chirp(self) -> "Tuple[int, float, float] | None":
+        with self._chirp_lock:
+            c = self._chirp
+            self._chirp = None
+        return c
+
     def _worker(self) -> None:
         while not self._stop.is_set():
+            chirp = self._take_chirp()
+            if chirp is not None:
+                beeps, on_s, off_s = chirp
+                for _ in range(beeps):
+                    if self._stop.is_set():
+                        break
+                    self._write(True)
+                    self._stop.wait(on_s)
+                    self._write(False)
+                    self._stop.wait(off_s)
+                continue
             if self._continuous and self._level > 0:
                 self._write(True)
                 self._stop.wait(0.05)

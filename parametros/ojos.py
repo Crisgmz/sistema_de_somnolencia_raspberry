@@ -65,6 +65,13 @@ class OjosParametros:
         self.last_center: Optional[np.ndarray] = None
         self.last_center_ts: Optional[float] = None
         self.fix_start_ts: Optional[float] = None
+        # Instante de la primera observacion ocular. La tasa de parpadeo
+        # (BLINK_FB) se mide en una ventana deslizante de 60s; recien arrancado
+        # (o tras restaurar calibracion) la ventana esta VACIA -> fb=0 -> se
+        # interpretaba como "muy pocos parpadeos" = somnolencia. Es un falso
+        # positivo de arranque en frio. Se exige que la ventana lleve al menos
+        # `perclos_window_s` observando antes de fiarse del lado bajo (fb<4).
+        self._obs_start_ts: Optional[float] = None
 
     def _update_fixation(self, ts: float, left_eye_center: Sequence[float], right_eye_center: Sequence[float]) -> float:
         center = (np.asarray(left_eye_center, dtype=np.float32) + np.asarray(right_eye_center, dtype=np.float32)) * 0.5
@@ -83,6 +90,11 @@ class OjosParametros:
 
     def update(self, ts: float, ear: float, left_eye_center: Sequence[float], right_eye_center: Sequence[float], calibration: Calibration, pose_reliable: bool = True):
         reliable = bool(pose_reliable)
+        if self._obs_start_ts is None:
+            self._obs_start_ts = float(ts)
+        # Ventana de parpadeo "caliente": lleva suficiente tiempo observando como
+        # para que fb_per_min sea significativo (no un cero de arranque en frio).
+        blink_window_warm = (float(ts) - self._obs_start_ts) >= self.perclos_window_s
         # Endurecimiento del umbral de cierre en condiciones adversas (noche/lentes).
         close_scale = 1.0
         if getattr(calibration, "nightmode", False):
@@ -178,7 +190,7 @@ class OjosParametros:
             "EYE_CLOSED_MS": build_param_output("EYE_CLOSED_MS", eye_closed_ms, normalize_linear(eye_closed_ms, self.microsleep_ms, 3000.0), immediate_eye_closed_event, 8 if eye_closed_ms < 1500.0 else 12, ts=ts),
             "PERCLOS": build_param_output("PERCLOS", perclos, normalize_linear(perclos, self.perclos_onset, self.perclos_severe * 2.0), calibration.calibrated and perclos >= self.perclos_onset, 10 if perclos < self.perclos_severe else 14, ts=ts),
             "BLINK_TC": build_param_output("BLINK_TC", self.last_tc_ms, normalize_linear(self.last_tc_ms, calibration.tc_baseline_ms, 700.0), blink_tc_event, 6, ts=ts),
-            "BLINK_FB": build_param_output("BLINK_FB", fb_per_min, max(normalize_linear(fb_per_min, 0.0, 4.0), normalize_linear(fb_per_min, 24.0, 40.0)), calibration.calibrated and (fb_per_min < 4.0 or fb_per_min > 32.0), 5, ts=ts),
+            "BLINK_FB": build_param_output("BLINK_FB", fb_per_min, max(normalize_linear(fb_per_min, 0.0, 4.0), normalize_linear(fb_per_min, 24.0, 40.0)), calibration.calibrated and ((blink_window_warm and fb_per_min < 4.0) or fb_per_min > 32.0), 5, ts=ts),
             "IBI": build_param_output("IBI", ibi_s, normalize_linear(ibi_s, 4.0, 12.0), calibration.calibrated and ibi_s >= 8.0, 4, ts=ts),
             "BLINK_AMPLITUDE": build_param_output("BLINK_AMPLITUDE", self.last_amp, normalize_linear(self.last_amp, 0.02, 0.18), blink_amplitude_event, 3, ts=ts),
             "REOPEN_SPEED": build_param_output("REOPEN_SPEED", self.last_reopen, normalize_linear(1.2 - self.last_reopen, 0.0, 1.2), reopen_speed_event, 5, ts=ts),

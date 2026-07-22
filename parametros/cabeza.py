@@ -46,6 +46,11 @@ class CabezaParametros:
         self.recovery_active = False
         self.recovery_start_ts: Optional[float] = None
         self.last_recovery = 0.0
+        # HEAD_RECOVERY es un evento MOMENTANEO: se dispara solo en el frame en
+        # que termina la recuperacion de un cabeceo, no de forma permanente. Antes
+        # `last_recovery` se quedaba fijo (p.ej. 22s) y el evento se re-disparaba
+        # en cada frame para siempre, fijando el score. Este flag lo consume una vez.
+        self._recovery_event_pending = False
         self.pitch_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)
         # Semilla temporal para solvePnP: reutilizar la pose previa estabiliza la
         # solucion (menos saltos/ambiguedad frame a frame) y por tanto reduce
@@ -86,7 +91,18 @@ class CabezaParametros:
             return 0.0, 0.0, 0.0
         self._rvec, self._tvec = rvec, tvec
         rot_matrix, _ = cv2.Rodrigues(rvec)
-        return _rotation_to_euler_deg(rot_matrix)
+        pitch, yaw, roll = _rotation_to_euler_deg(rot_matrix)
+        # Ambiguedad de pose frontal en solvePnP: la descomposicion de Euler a
+        # veces devuelve el roll "volteado" ~±180 (R[0,0]<0) en vez del giro
+        # real ~0. Un conductor sentado NUNCA rueda la cabeza >90 grados, asi que
+        # un |roll| cercano a 180 es el reflejo del solver, no un giro fisico. Se
+        # pliega al rango fisico [-90, 90] restando/sumando 180 para eliminar el
+        # falso giro de ~175 grados que disparaba ROLL de forma espuria.
+        if roll > 90.0:
+            roll -= 180.0
+        elif roll < -90.0:
+            roll += 180.0
+        return pitch, yaw, roll
 
     def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration, rotation_index: int = 0):
         pitch, yaw, roll = self._pose(landmarks, frame_w, frame_h, rotation_index)
@@ -105,6 +121,7 @@ class CabezaParametros:
             self.last_recovery = max(0.0, ts - (self.recovery_start_ts if self.recovery_start_ts is not None else ts))
             self.recovery_active = False
             self.recovery_start_ts = None
+            self._recovery_event_pending = True
 
         self.pitch_hist.append((ts, pitch))
         while self.pitch_hist and (ts - self.pitch_hist[0][0]) > 6.0:
@@ -123,12 +140,15 @@ class CabezaParametros:
                 total = float(np.sum(spec[1:] ** 2)) if spec.size > 2 else 0.0
                 micro_value = float(np.sum(spec[band] ** 2) / total) if total > 1e-9 else 0.0
 
+        recovery_event = calibration.calibrated and self._recovery_event_pending and self.last_recovery >= 2.3
+        self._recovery_event_pending = False
+
         return {
             "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
             "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), calibration.calibrated and abs(angle_delta_deg(roll, calibration.roll_neutral)) >= 32.0, 4, ts=ts),
             "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), calibration.calibrated and abs(angle_delta_deg(yaw, calibration.yaw_neutral)) >= 40.0, 2, ts=ts),
             "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and velocity >= 25.0, 6, ts=ts),
-            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), calibration.calibrated and self.last_recovery >= 2.3, 5, ts=ts),
+            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), recovery_event, 5, ts=ts),
             "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.3, 0.8), calibration.calibrated and micro_value >= 0.55, 0, ts=ts),
         }
 

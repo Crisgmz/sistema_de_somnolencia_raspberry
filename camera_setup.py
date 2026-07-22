@@ -3,7 +3,10 @@ import shutil
 import subprocess
 import time
 
-from picamera2 import Picamera2
+try:
+    from picamera2 import Picamera2
+except ImportError:  # Sin bindings de libcamera para esta version de Python
+    Picamera2 = None
 
 
 def _find_camera_users():
@@ -75,6 +78,8 @@ def list_opencv_candidates() -> list[str]:
 
 
 def list_picamera_cameras() -> list[dict]:
+    if Picamera2 is None:
+        return []
     try:
         return Picamera2.global_camera_info()
     except Exception:

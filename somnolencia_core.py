@@ -6,8 +6,14 @@ from scipy.spatial import distance as dist
 OJO_IZQ = [362, 385, 387, 263, 373, 380]
 OJO_DER = [33, 160, 158, 133, 153, 144]
 
-# Landmarks de boca para MAR
-BOCA = [61, 291, 0, 17, 84, 314, 405, 321]
+# Landmarks de boca para MAR (Mouth Aspect Ratio).
+# Orden: [comisura_izq, comisura_der, sup_izq, inf_izq, sup_der, inf_der, sup_centro, inf_centro]
+# El conjunto anterior [61,291,0,17,84,314,405,321] mezclaba puntos del mismo
+# labio (p.ej. 17 y 314, ambos inferiores) y usaba dist(61,84) como denominador
+# (NO es el ancho de la boca), lo que inflaba el MAR a ~0.9 con la boca cerrada.
+# Ahora se emparejan labio SUPERIOR->INFERIOR (37-84, 267-314, 0-17) y se divide
+# por el ancho real comisura-a-comisura (61-291), como manda la definicion de MAR.
+BOCA = [61, 291, 37, 84, 267, 314, 0, 17]
 
 # Landmarks usados para estimar pose de cabeza (pitch/yaw/roll)
 POSE_IDX = [1, 152, 33, 263, 61, 291]
@@ -94,11 +100,14 @@ def get_mar(landmarks, points, w, h, rotation_index=0):
             
         coords.append(np.array([x, y]))
 
-    # MAR = (A + B + C) / (2*D)
-    a = dist.euclidean(coords[1], coords[7])
-    b = dist.euclidean(coords[2], coords[6])
-    c = dist.euclidean(coords[3], coords[5])
-    d = dist.euclidean(coords[0], coords[4])
+    # MAR = (A + B + C) / (2*D), con A/B/C aperturas verticales del labio
+    # (superior->inferior) y D el ancho horizontal comisura-a-comisura.
+    # Indices segun BOCA: 0=com_izq 1=com_der 2=sup_izq 3=inf_izq 4=sup_der
+    # 5=inf_der 6=sup_centro 7=inf_centro.
+    a = dist.euclidean(coords[2], coords[3])  # 37 -> 84  (izquierda)
+    b = dist.euclidean(coords[4], coords[5])  # 267 -> 314 (derecha)
+    c = dist.euclidean(coords[6], coords[7])  # 0 -> 17   (centro)
+    d = dist.euclidean(coords[0], coords[1])  # 61 -> 291 (ancho)
     return (a + b + c) / (2.0 * d) if d > 0 else 0.0
 
 
