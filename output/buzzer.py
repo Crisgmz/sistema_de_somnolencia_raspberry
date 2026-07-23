@@ -1,7 +1,20 @@
-"""Control de buzzer GPIO por nivel de alerta."""
+"""Control de buzzer GPIO por nivel de alerta.
+
+Soporta buzzer PASIVO (piezo sin oscilador propio): el tono se genera por PWM a
+una frecuencia audible. Un buzzer pasivo NO suena con solo poner el pin en HIGH
+(corriente continua); necesita una senal alterna (PWM) para vibrar. La frecuencia
+y el ciclo de trabajo (volumen aparente) son configurables por entorno:
+
+    SOMNO_BUZZER_FREQ   frecuencia del tono en Hz (default 2700, cerca de la
+                        resonancia tipica de un piezo -> maximo volumen)
+    SOMNO_BUZZER_DUTY   ciclo de trabajo 1-99 % (default 50)
+
+Si el PWM no esta disponible (o el buzzer es ACTIVO), se degrada a on/off simple.
+"""
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Dict, Tuple
@@ -10,6 +23,13 @@ try:
     import RPi.GPIO as GPIO
 except Exception:
     GPIO = None
+
+
+def _env_f(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 class Buzzer:
@@ -32,6 +52,12 @@ class Buzzer:
         self.pin = int(pin)
         self.active_high = bool(active_high)
         self.enabled = bool(enabled) and GPIO is not None
+        # Tono del buzzer pasivo. La frecuencia optima depende del piezo; 2700 Hz
+        # es un buen punto de partida. Si suena flojo, prueba 2000-4000 Hz.
+        self._freq = max(50.0, _env_f("SOMNO_BUZZER_FREQ", 2700.0))
+        self._duty = min(99.0, max(1.0, _env_f("SOMNO_BUZZER_DUTY", 50.0)))
+        self._pwm = None
+        self._use_pwm = False
         self._stop = threading.Event()
         self._level = 0
         self._continuous = False
@@ -45,19 +71,35 @@ class Buzzer:
             try:
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setup(self.pin, GPIO.OUT)
+                # Se intenta PWM (necesario para buzzer pasivo). Si falla, se usa
+                # on/off simple (buzzer activo).
+                try:
+                    self._pwm = GPIO.PWM(self.pin, self._freq)
+                    self._pwm.start(0.0)  # arranca en silencio (duty 0)
+                    self._use_pwm = True
+                    print(f"[BUZZER] PWM activo pin={self.pin} freq={self._freq:.0f}Hz duty={self._duty:.0f}%")
+                except Exception as exc_pwm:
+                    self._use_pwm = False
+                    print(f"[BUZZER] Sin PWM ({exc_pwm}); usando on/off simple")
             except Exception as exc:
                 self.enabled = False
                 print(f"[WARN] Buzzer deshabilitado por error GPIO: {exc}")
         self._thread.start()
 
-    def _write(self, on: bool) -> None:
+    def _tone(self, on: bool) -> None:
+        """Enciende (tono) o apaga el buzzer."""
         if not self.enabled:
             return
         try:
-            if self.active_high:
-                GPIO.output(self.pin, GPIO.HIGH if on else GPIO.LOW)
+            if self._use_pwm and self._pwm is not None:
+                # Tono via PWM: duty configurado = sonando; duty 0 = silencio.
+                self._pwm.ChangeDutyCycle(self._duty if on else 0.0)
             else:
-                GPIO.output(self.pin, GPIO.LOW if on else GPIO.HIGH)
+                # Buzzer activo: nivel logico segun active_high.
+                if self.active_high:
+                    GPIO.output(self.pin, GPIO.HIGH if on else GPIO.LOW)
+                else:
+                    GPIO.output(self.pin, GPIO.LOW if on else GPIO.HIGH)
         except Exception:
             self.enabled = False
 
@@ -94,30 +136,35 @@ class Buzzer:
                 for _ in range(beeps):
                     if self._stop.is_set():
                         break
-                    self._write(True)
+                    self._tone(True)
                     self._stop.wait(on_s)
-                    self._write(False)
+                    self._tone(False)
                     self._stop.wait(off_s)
                 continue
             if self._continuous and self._level > 0:
-                self._write(True)
+                self._tone(True)
                 self._stop.wait(0.05)
                 continue
             on_s, off_s = self.PATTERNS[self._level]
             if on_s <= 0.0:
-                self._write(False)
+                self._tone(False)
                 self._stop.wait(0.15)
                 continue
-            self._write(True)
+            self._tone(True)
             self._stop.wait(on_s)
-            self._write(False)
+            self._tone(False)
             self._stop.wait(off_s)
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=1.0)
-        self._write(False)
+        self._tone(False)
         if self.enabled:
+            try:
+                if self._use_pwm and self._pwm is not None:
+                    self._pwm.stop()
+            except Exception:
+                pass
             try:
                 GPIO.cleanup(self.pin)
             except Exception:

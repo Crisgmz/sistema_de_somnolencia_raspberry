@@ -77,6 +77,10 @@ class RuntimeState:
     last_session_sync: float = 0.0
     last_score_state_persist: float = 0.0
     last_score_state_value: int = -1
+    # Instante en que arranca la calibracion REAL: el primer frame con un rostro
+    # estable y de frente tras el calentamiento de camara. La ventana de 5 min se
+    # cuenta desde aqui, NO desde el boot (donde la camara aun se esta asentando).
+    calib_anchor_ts: float = 0.0
 
 
 class HandsWorker(threading.Thread):
@@ -191,7 +195,37 @@ class SomnolenciaSystem:
         self.level_stabilizer = LevelStabilizer(StabilizerConfig.from_env(os.getenv))
         # Estabilidad minima de landmarks para aceptar el rostro como valido
         # (evita falsos positivos por caras espurias en texturas de fondo).
-        self.face_quality_min = float(os.getenv("SOMNO_FACE_QUALITY_MIN", "0.30"))
+        # Subido de 0.30 a 0.45: con estabilidad ~0.30 los landmarks aun saltan lo
+        # suficiente para producir EAR/MAR/pose basura (falsos cabeceos y cierres).
+        # Exigir >=0.45 asegura que solo se puntue con landmarks realmente firmes.
+        self.face_quality_min = float(os.getenv("SOMNO_FACE_QUALITY_MIN", "0.45"))
+        # Calentamiento de camara: al encender el equipo (autostart), la camara
+        # tarda unos segundos en asentar exposicion/enfoque/balance de blancos.
+        # Durante este margen NO se calibra ni se puntua (los landmarks saltan y
+        # ensuciarian la calibracion: yaw torcido, falsos cabeceos, score a 100).
+        self.camera_warmup_s = float(os.getenv("SOMNO_WARMUP_S", "6.0"))
+        # Lado mayor del frame para MediaPipe. Subido de 320 a 640 (captura
+        # completa): a 320px los ojos quedan en ~13px y el EAR/landmarks son puro
+        # ruido -> falsos cierres e inestabilidad. A 640px hay el doble de detalle.
+        self.mp_proc_long = int(os.getenv("SOMNO_MP_LONG", "640"))
+        # Modo demo: el CIERRE DE OJOS y el bostezo son los detectores robustos.
+        # Los eventos de POSE (solvePnP) y de MIRADA/tasa-de-parpadeo tiemblan con
+        # camara/luz marginal y generaban falsos que subian el score sin cerrar
+        # los ojos. En modo demo se de-priorizan (no puntuan). Se puede apagar con
+        # SOMNO_DEMO_MODE=0 para el sistema completo (informe/tesis).
+        self.demo_mode = os.getenv("SOMNO_DEMO_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+        # En modo demo puntuan solo los detectores CANONICOS de cierre de ojos
+        # (EYE_CLOSED_MS = microsueno; PERCLOS = % de cierre, sube gradual) y el
+        # bostezo. Se suprimen: pose/mirada (temblorosos) y las metricas de
+        # FORMA de parpadeo (BLINK_TC/amplitud/velocidad-reapertura), que median
+        # el MISMO cierre y apilaban ~+14 extra por cierre -> el score saltaba de
+        # golpe. Asi el score sube proporcional a la duracion del cierre, no a saltos.
+        self.demo_suppressed = {
+            "HEAD_DROP_VELOCITY", "PITCH", "ROLL", "YAW", "HEAD_RECOVERY",
+            "HEAD_MICRO_OSC", "FIXATION", "IBI", "BLINK_FB", "MUSCLE_TONE",
+            "LANDMARK_STABILITY", "FACIAL_ASYMMETRY",
+            "BLINK_TC", "BLINK_AMPLITUDE", "REOPEN_SPEED", "EAR",
+        }
         # Periodo de gracia ante perdida breve de rostro: durante estos segundos
         # NO se decae el score ni se relaja la histeresis del nivel, de modo que
         # quitar la cara y volver a ponerla no borra los datos acumulados.
@@ -459,13 +493,15 @@ class SomnolenciaSystem:
             return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return frame
 
-    @staticmethod
-    def _build_mediapipe_frame(frame: np.ndarray) -> np.ndarray:
-        # Escala PRESERVANDO la relacion de aspecto (lado mayor -> MP_PROC_LONG).
+    def _build_mediapipe_frame(self, frame: np.ndarray) -> np.ndarray:
+        # Escala PRESERVANDO la relacion de aspecto (lado mayor -> mp_proc_long).
         # Estirar el frame distorsiona toda la geometria facial y la pose.
+        # Mas resolucion = mas pixeles en ojos/boca = EAR/MAR y landmarks mas
+        # estables (menos ruido). Configurable por SOMNO_MP_LONG (default 640 =
+        # usa la captura completa). Bajarlo si el FPS cae demasiado.
         h, w = frame.shape[:2]
         long_side = max(w, h)
-        target = SomnolenciaSystem.MP_PROC_LONG
+        target = self.mp_proc_long
         if long_side <= target:
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         scale = float(target) / float(long_side)
@@ -957,13 +993,42 @@ class SomnolenciaSystem:
                 out_contexto = self.contexto.update(ts, display_frame, has_event, self.calibration)
                 param_outputs.extend(list(out_contexto.values()))
 
+                # Modo demo: anula el eventflag de los parametros de pose/mirada
+                # (temblorosos) para que NO puntuen. El cierre de ojos, PERCLOS,
+                # EAR sostenido y bostezo siguen intactos. No afecta calibracion ni
+                # face_quality (que leen valores, no eventflags) ni la emergencia.
+                if self.demo_mode:
+                    for _p in param_outputs:
+                        if _p.get("paramid") in self.demo_suppressed:
+                            _p["eventflag"] = False
+
+                # Gate de calidad de rostro: MediaPipe a veces detecta un "rostro"
+                # espurio en texturas (p.ej. una pared) o entrega landmarks
+                # inestables mientras la camara se asienta. Solo se considera rostro
+                # valido si la deteccion es estable (LANDMARK_STABILITY alto). Se
+                # calcula ANTES de la calibracion para gobernarla con el mismo
+                # criterio: no calibrar sobre frames basura. Umbral configurable.
+                landmark_stability = float(self._param_value(param_outputs, "LANDMARK_STABILITY", 0.0)) if face_detected else 0.0
+                face_quality_ok = face_detected and landmark_stability >= self.face_quality_min
+                camera_warm = (ts - state.started_at) >= self.camera_warmup_s
+                # Durante el calentamiento de camara NO se puntua ni se detecta
+                # emergencia, aunque la calibracion este restaurada: los primeros
+                # segundos tras el boot (autofoco/exposicion/AWB) son basura y
+                # disparaban el score a 100 nada mas encender el equipo.
+                if not camera_warm:
+                    face_quality_ok = False
+
                 if not self.calibration.calibrated:
-                    elapsed = ts - state.started_at
-                    if face_detected:
-                        # Pose neutra: media CIRCULAR (solo requiere rostro; la pose
-                        # por solvePnP es robusta a la luz). El pitch/roll crudos
-                        # rondan ±180 y saltan el wraparound; la media circular da
-                        # el neutro correcto donde una EMA lineal daba basura.
+                    # La calibracion solo INICIA y AVANZA con la camara ya asentada
+                    # (tras el calentamiento) y un rostro ESTABLE de frente. Asi no
+                    # se calibra sobre los primeros segundos de arranque (yaw
+                    # torcido, EAR/MAR basura). La ventana de 5 min se ancla al
+                    # primer frame bueno, no al boot.
+                    if camera_warm and face_quality_ok:
+                        if state.calib_anchor_ts == 0.0:
+                            state.calib_anchor_ts = ts
+                            print("[CALIB] Rostro estable detectado; iniciando calibracion.")
+                        # Pose neutra: media CIRCULAR (robusta al wraparound ±180).
                         self.calibration.pitch_neutral = self._pitch_mean.update(pitch)
                         self.calibration.roll_neutral = self._roll_mean.update(roll)
                         self.calibration.yaw_neutral = self._yaw_mean.update(yaw)
@@ -984,7 +1049,7 @@ class SomnolenciaSystem:
                             if 0.0 < asym_value < 0.30:
                                 self.calibration.asymmetry_base = 0.99 * self.calibration.asymmetry_base + 0.01 * asym_value
                     calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "300"))
-                    if elapsed >= calibration_seconds:
+                    if state.calib_anchor_ts > 0.0 and (ts - state.calib_anchor_ts) >= calibration_seconds:
                         self._finalize_calibration()
 
                 for p in param_outputs:
@@ -993,12 +1058,6 @@ class SomnolenciaSystem:
                 rules = self.rule_engine.latest()
                 score_forced_min_level = rules.get("forced_min_level", 0) if face_detected else 0
                 score_forced_reasons = rules.get("reasons", []) if face_detected else []
-                # Gate de calidad de rostro: MediaPipe a veces detecta un "rostro"
-                # espurio en texturas (p.ej. una pared), lo que disparaba falsos
-                # positivos. Solo se considera rostro valido si la deteccion es
-                # estable (LANDMARK_STABILITY alto). Umbral configurable.
-                landmark_stability = float(self._param_value(param_outputs, "LANDMARK_STABILITY", 0.0)) if face_detected else 0.0
-                face_quality_ok = face_detected and landmark_stability >= self.face_quality_min
                 score_forced_min_level = score_forced_min_level if face_quality_ok else 0
                 score_forced_reasons = score_forced_reasons if face_quality_ok else []
 
@@ -1197,6 +1256,7 @@ class SomnolenciaSystem:
                     emergency_type=emergency.get("emergencytype"),
                     fixed_buzzer=bool(emergency.get("fixedbuzzer", False)),
                     driver_clear=driver_clear,
+                    face_present=bool(face_detected),
                 )
 
                 self.recorder.append(ts, build_record(ts, telemetry, pv))

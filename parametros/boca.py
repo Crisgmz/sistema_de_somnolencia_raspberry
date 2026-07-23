@@ -27,12 +27,24 @@ class BocaParametros:
             self.yawn_active = True
             self.yawn_start_ts = ts
         elif mar < thr and self.yawn_active:
+            dur = max(0.0, ts - (self.yawn_start_ts if self.yawn_start_ts is not None else ts))
             self.yawn_active = False
-            self.last_yawn_dur = max(0.0, ts - (self.yawn_start_ts if self.yawn_start_ts is not None else ts))
-            self.yawn_count += 1
             self.yawn_start_ts = None
+            # Solo cuenta como bostezo si la apertura fue SOSTENIDA (>=0.8s).
+            # Hablar abre/cierra la boca en <0.5s y no debe inflar el conteo.
+            if dur >= 0.8:
+                self.last_yawn_dur = dur
+                self.yawn_count += 1
 
-        event = reliable and calibration.calibrated and mar >= thr
+        # Duracion de la apertura en curso.
+        mouth_open_ms = 0.0
+        if self.yawn_active and self.yawn_start_ts is not None:
+            mouth_open_ms = max(0.0, (ts - self.yawn_start_ts) * 1000.0)
+        # MAR solo puntua con apertura SOSTENIDA (>=500ms) = bostezo real, no una
+        # apertura breve al hablar ni ruido de landmarks. Sin esto, cualquier
+        # movimiento de boca subia el score sin somnolencia (igual que los
+        # parpadeos con EAR).
+        event = reliable and calibration.calibrated and mar >= thr and mouth_open_ms >= 500.0
         return {
             "MAR": build_param_output("MAR", mar, normalize_linear(mar, calibration.mar_baseline * 1.1, calibration.mar_baseline * 2.0), event, 4 if event else 0, ts=ts),
             "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 2.0, 7.0), calibration.calibrated and self.yawn_count >= 4, 5, ts=ts),

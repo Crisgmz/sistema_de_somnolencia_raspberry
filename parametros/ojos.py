@@ -178,15 +178,35 @@ class OjosParametros:
         if self.blink_active and self.blink_start_ts is not None:
             eye_closed_ms = max(0.0, (ts - self.blink_start_ts) * 1000.0)
 
-        immediate_eye_closed_event = eye_closed_ms >= self.microsleep_ms and not self.eye_closed_event_reported
+        # Microsueno: solo cuenta con calibracion terminada. Durante los 5 min de
+        # calibracion el umbral de cierre (close_thr) aun se esta asentando
+        # (ear_baseline parte de 0.28 y open_ref adapta despacio), por lo que unos
+        # ojos ABIERTOS pueden medir por debajo del umbral y disparar un falso
+        # microsueno que subia el score a 100 mientras se calibraba. Ya calibrado,
+        # close_thr tiene un piso correcto derivado del ear_baseline real.
+        immediate_eye_closed_event = (
+            calibration.calibrated
+            and eye_closed_ms >= self.microsleep_ms
+            and not self.eye_closed_event_reported
+        )
         if immediate_eye_closed_event:
             self.eye_closed_event_reported = True
         blink_tc_event = self.blink_metrics_event_pending and calibration.calibrated and self.last_tc_ms >= 800.0
         blink_amplitude_event = self.blink_metrics_event_pending and calibration.calibrated and 0.0 < self.last_amp < 0.035
         reopen_speed_event = self.blink_metrics_event_pending and calibration.calibrated and 0.0 < self.last_reopen < 0.12
         self.blink_metrics_event_pending = False
+        # El evento EAR debe reflejar cierre SOSTENIDO (somnolencia), no un
+        # parpadeo normal (~100-300 ms). Sin este umbral, cada parpadeo disparaba
+        # EAR: sumaba al score ~15 veces/min y ademas reiniciaba el temporizador
+        # de recuperacion -> el score subia sin parar y NUNCA bajaba. Se exige que
+        # el ojo lleve >=400 ms cerrado (por encima de un parpadeo). El cierre
+        # prolongado real ya lo cubren EYE_CLOSED_MS (>=500ms) y PERCLOS.
+        ear_event = (
+            reliable and calibration.calibrated
+            and ear < close_thr and eye_closed_ms >= 400.0
+        )
         return {
-            "EAR": build_param_output("EAR", ear, normalize_linear(max(0.0, calibration.ear_baseline - ear), 0.0, 0.20), reliable and calibration.calibrated and ear < close_thr, 2, ts=ts),
+            "EAR": build_param_output("EAR", ear, normalize_linear(max(0.0, calibration.ear_baseline - ear), 0.0, 0.20), ear_event, 2, ts=ts),
             "EYE_CLOSED_MS": build_param_output("EYE_CLOSED_MS", eye_closed_ms, normalize_linear(eye_closed_ms, self.microsleep_ms, 3000.0), immediate_eye_closed_event, 8 if eye_closed_ms < 1500.0 else 12, ts=ts),
             "PERCLOS": build_param_output("PERCLOS", perclos, normalize_linear(perclos, self.perclos_onset, self.perclos_severe * 2.0), calibration.calibrated and perclos >= self.perclos_onset, 10 if perclos < self.perclos_severe else 14, ts=ts),
             "BLINK_TC": build_param_output("BLINK_TC", self.last_tc_ms, normalize_linear(self.last_tc_ms, calibration.tc_baseline_ms, 700.0), blink_tc_event, 6, ts=ts),

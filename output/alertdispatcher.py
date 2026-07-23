@@ -133,12 +133,18 @@ class AlertDispatcher:
         emergency_type: str | None = None,
         fixed_buzzer: bool = False,
         driver_clear: bool = False,
+        face_present: bool = True,
     ) -> Dict:
         out_level = self._apply_hysteresis(level, emergency)
         buzzer_level = self._delayed_buzzer_level(out_level, emergency)
         buzzer_level = self._quiet_when_recovered(buzzer_level, driver_clear, emergency)
+        # SIN ROSTRO NO SUENA: si no hay cara detectada, el buzzer queda en
+        # silencio pase lo que pase (arranque sin nadie, conductor fuera de cuadro).
+        # La telemetria/MQTT sí puede seguir reportando; solo se silencia el sonido.
+        if not face_present:
+            buzzer_level = 0
         self.buzzer.set_level(buzzer_level)
-        self.buzzer.set_continuous(bool(fixed_buzzer) and buzzer_level > 0)
+        self.buzzer.set_continuous(bool(fixed_buzzer) and buzzer_level > 0 and face_present)
         self.mqtt.set_level(out_level)
 
         enriched = dict(payload)

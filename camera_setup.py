@@ -1,4 +1,5 @@
 import glob
+import os
 import shutil
 import subprocess
 import time
@@ -142,14 +143,27 @@ def setup_camera(max_retries=6, retry_delay=0.8):
                 message.append("Procesos detectados usando la cámara:\n" + users)
             raise RuntimeError("\n".join(message)) from last_error
 
-    # Perfil visual neutro para evitar apariencia "filtrada".
-    picam2.set_controls(
-        {
-            "AfMode": 2,
-            "AeExposureMode": 0,
-            "AwbMode": 0,
-            "Brightness": 0.0,
-            "Contrast": 1.0,
-        }
-    )
+    # Enfoque: por defecto continuo (AfMode=2). PROBLEMA en monitor a distancia
+    # fija: el enfoque continuo "caza" y desenfoca periodicamente -> landmarks
+    # inestables (LANDMARK_STABILITY oscila 0.3<->0.9). Si se define
+    # SOMNO_LENS_POSITION (dioptrias = 1/distancia_m; p.ej. 45cm -> ~2.2) se FIJA
+    # el enfoque en manual y se elimina el cazado. Ajustalo hasta ver la imagen
+    # nitida. Rango tipico 0 (infinito) .. 10 (macro).
+    lens_env = os.getenv("SOMNO_LENS_POSITION", "").strip()
+    controls = {
+        "AeExposureMode": 0,
+        "AwbMode": 0,
+        "Brightness": 0.0,
+        "Contrast": 1.0,
+    }
+    if lens_env:
+        try:
+            controls["AfMode"] = 0  # manual
+            controls["LensPosition"] = float(lens_env)
+            print(f"[CAMARA] Enfoque FIJO manual LensPosition={float(lens_env):.2f}")
+        except ValueError:
+            controls["AfMode"] = 2
+    else:
+        controls["AfMode"] = 2  # continuo (comportamiento original)
+    picam2.set_controls(controls)
     return picam2

@@ -41,6 +41,10 @@ class DynamicFatigueScore:
     recovery_per_s: float = field(default_factory=lambda: _env_f("SOMNO_RECOVERY_PER_S", 3.0))
     _recovery_base: float = -1.0
     _recovery_anchor_ts: float = 0.0
+    # Ganancia global de SUBIDA: escala cuanto suma cada evento de fatiga. 1.0 =
+    # normal; 0.5 = sube a la mitad de velocidad (menos "trigger-happy"). Permite
+    # equilibrar la sensibilidad de subida con la de bajada (recovery_per_s).
+    rise_gain: float = field(default_factory=lambda: _env_f("SOMNO_RISE_GAIN", 1.0))
 
     def restore(self, state: Dict, now_ts: float | None = None) -> None:
         self.score = max(0, min(100, int(state.get("score", 0))))
@@ -133,18 +137,28 @@ class DynamicFatigueScore:
         # Rostro valido: cerrar cualquier ventana de ausencia previa.
         self._sensor_invalid_since = 0.0
 
-        deltas = 0
+        deltas = 0.0
         current_event_params: set[str] = set()
         current_reasons: List[str] = []
         had_new_event = False
         for out in param_outputs:
-            if bool(out.get("eventflag", False)):
-                param_id = str(out.get("paramid", "UNKNOWN"))
-                current_event_params.add(param_id)
-                current_reasons.append(param_id)
-                if param_id not in self.active_event_params:
-                    had_new_event = True
-                    deltas += int(out.get("fatiguescoredelta", 0))
+            if not bool(out.get("eventflag", False)):
+                continue
+            delta = int(out.get("fatiguescoredelta", 0))
+            # Solo la evidencia con PESO de fatiga (delta > 0) mantiene el score
+            # elevado y reinicia el temporizador de recuperacion. Los flags de
+            # contexto de peso 0 (CIRCADIAN entre 2-6h/13-15h, HEAD_MICRO_OSC,
+            # FACIAL_ASYMMETRY) son informativos: si contaran como "evidencia",
+            # bloquearian la recuperacion y el score nunca bajaria (p.ej. probando
+            # a las 2 PM el score subia y se quedaba en 100 para siempre).
+            if delta <= 0:
+                continue
+            param_id = str(out.get("paramid", "UNKNOWN"))
+            current_event_params.add(param_id)
+            current_reasons.append(param_id)
+            if param_id not in self.active_event_params:
+                had_new_event = True
+                deltas += delta * self.rise_gain
 
         if current_event_params:
             self.restored_requires_fresh_event = False
@@ -171,7 +185,7 @@ class DynamicFatigueScore:
                 self._recovery_base = -1.0
 
         self.active_event_params = current_event_params
-        self.score = max(0, min(100, self.score + deltas))
+        self.score = max(0, min(100, self.score + int(round(deltas))))
         if self.score == 0:
             self.restored_requires_fresh_event = False
         self.max_score_seen = max(self.max_score_seen, self.score)

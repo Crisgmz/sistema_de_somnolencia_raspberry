@@ -51,6 +51,11 @@ class CabezaParametros:
         # `last_recovery` se quedaba fijo (p.ej. 22s) y el evento se re-disparaba
         # en cada frame para siempre, fijando el score. Este flag lo consume una vez.
         self._recovery_event_pending = False
+        # Ventana corta de pitch para medir la velocidad de cabeceo sobre ~0.35s
+        # en vez de frame-a-frame. El solvePnP tiembla (picos de un frame) y una
+        # velocidad instantanea disparaba HEAD_DROP falsos; sobre la ventana el
+        # ruido promedia ~0 y solo una caida SOSTENIDA (cabeceo real) la supera.
+        self._pitch_win: Deque[Tuple[float, float]] = deque(maxlen=60)
         self.pitch_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)
         # Semilla temporal para solvePnP: reutilizar la pose previa estabiliza la
         # solucion (menos saltos/ambiguedad frame a frame) y por tanto reduce
@@ -106,10 +111,17 @@ class CabezaParametros:
 
     def update(self, ts: float, landmarks: Sequence, frame_w: int, frame_h: int, calibration: Calibration, rotation_index: int = 0):
         pitch, yaw, roll = self._pose(landmarks, frame_w, frame_h, rotation_index)
+        # Velocidad de cabeceo sobre una VENTANA corta (~0.35s), no frame a frame.
+        # Diferencia circular (evita el wraparound ±180). El temblor de solvePnP
+        # (picos de un frame) se promedia a ~0; un cabeceo real (caida sostenida)
+        # sí supera el umbral. Esto elimina los HEAD_DROP falsos por jitter.
+        self._pitch_win.append((float(ts), float(pitch)))
+        while self._pitch_win and (ts - self._pitch_win[0][0]) > 0.35:
+            self._pitch_win.popleft()
         velocity = 0.0
-        if self.prev_pitch is not None and self.prev_ts is not None:
-            # Diferencia circular: evita picos espurios por el wraparound ±180.
-            velocity = angle_delta_deg(pitch, self.prev_pitch) / max(1e-3, ts - self.prev_ts)
+        if len(self._pitch_win) >= 3:
+            t0, p0 = self._pitch_win[0]
+            velocity = angle_delta_deg(pitch, p0) / max(1e-3, ts - t0)
         self.prev_pitch = pitch
         self.prev_ts = ts
 
@@ -147,7 +159,7 @@ class CabezaParametros:
             "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
             "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), calibration.calibrated and abs(angle_delta_deg(roll, calibration.roll_neutral)) >= 32.0, 4, ts=ts),
             "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), calibration.calibrated and abs(angle_delta_deg(yaw, calibration.yaw_neutral)) >= 40.0, 2, ts=ts),
-            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and velocity >= 25.0, 6, ts=ts),
+            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and 25.0 <= velocity <= 130.0, 6, ts=ts),
             "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), recovery_event, 5, ts=ts),
             "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.3, 0.8), calibration.calibrated and micro_value >= 0.55, 0, ts=ts),
         }
