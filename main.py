@@ -435,12 +435,17 @@ class SomnolenciaSystem:
             return False, None
         if frame_raw is None:
             return False, None
-        # Sin conversion/manipulacion de color:
-        # Si llega en 4 canales (por ejemplo XBGR/RGBA), no se transforma aqui.
-        # if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
-        #     return True, np.ascontiguousarray(frame_raw[:, :, :3])
+        # Peculiaridad de picamera2: el formato "BGR888" entrega el array en
+        # orden de canales RGB (el nombre esta invertido respecto a numpy/cv2).
+        # Todo el pipeline (cv2.imshow y el cvtColor BGR2RGB para MediaPipe)
+        # asume BGR, por lo que hay que voltear R<->B una vez aqui. Sintomas del
+        # bug: la piel se veia azulada en pantalla y MediaPipe recibia los colores
+        # cruzados (landmarks mas ruidosos). Si llega en 4 canales, se descarta
+        # el alfa y se voltea igual.
+        if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
+            frame_raw = frame_raw[:, :, :3]
         if frame_raw.ndim == 3 and frame_raw.shape[2] == 3:
-            return True, np.ascontiguousarray(frame_raw)
+            return True, np.ascontiguousarray(frame_raw[:, :, ::-1])
         return False, None
 
     @staticmethod
@@ -970,7 +975,10 @@ class SomnolenciaSystem:
                             if 0.12 <= ear <= 0.45 and ear >= 0.75 * self.calibration.ear_baseline:
                                 self.calibration.ear_baseline = 0.99 * self.calibration.ear_baseline + 0.01 * ear
                             # MAR: solo boca cerrada (descarta bostezos/habla).
-                            if 0.05 <= mar <= self.calibration.mar_baseline * 1.3:
+                            # Banda relativa al baseline (rechaza aperturas) con
+                            # piso/techo absolutos plausibles para la formula actual
+                            # (boca cerrada ~0.35-0.55; un bostezo supera 0.7).
+                            if 0.15 <= mar <= self.calibration.mar_baseline * 1.4:
                                 self.calibration.mar_baseline = 0.99 * self.calibration.mar_baseline + 0.01 * mar
                             # Asimetria facial de reposo del conductor (descarta ruido).
                             if 0.0 < asym_value < 0.30:
@@ -1173,6 +1181,14 @@ class SomnolenciaSystem:
                     },
                 }
 
+                # Senal de "conductor despejado" para el auto-silencio del buzzer:
+                # rostro fiable y SIN eventos reales de fatiga en curso. Se ignoran
+                # los parametros de contexto (circadiano, tiempo en tarea, etc.) que
+                # estan "activos" de forma permanente sin implicar somnolencia actual.
+                CONTEXT_PARAMS = {"CIRCADIAN", "TIME_ON_TASK", "MONOTONY", "ILLUMINATION"}
+                realtime_events = [p for p in active_event_params if p not in CONTEXT_PARAMS]
+                driver_clear = bool(face_quality_ok) and not realtime_events
+
                 telemetry = self.dispatcher.dispatch(
                     level=int(score_out["level"]),
                     reasons=list(score_out.get("reasons", [])),
@@ -1180,6 +1196,7 @@ class SomnolenciaSystem:
                     emergency=bool(emergency["emergencyflag"]),
                     emergency_type=emergency.get("emergencytype"),
                     fixed_buzzer=bool(emergency.get("fixedbuzzer", False)),
+                    driver_clear=driver_clear,
                 )
 
                 self.recorder.append(ts, build_record(ts, telemetry, pv))

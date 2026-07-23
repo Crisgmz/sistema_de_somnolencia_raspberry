@@ -6,11 +6,19 @@ y cooldown para reducir publicaciones MQTT redundantes.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Dict, List
 
 from output.buzzer import Buzzer
 from output.mqttpublisher import MqttPublisher
+
+
+def _env_f(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 class AlertDispatcher:
@@ -21,6 +29,12 @@ class AlertDispatcher:
     MQTT_DEDUP_S = 2.0
 
     SUPERVISOR_COOLDOWN_S = 30.0  # minimo entre notificaciones al supervisor
+
+    # Auto-silencio del buzzer: si el conductor lleva este tiempo SIN senales
+    # reales de fatiga (despierto, mirando bien), se calla el buzzer aunque la
+    # histeresis del score siga elevada. Evita el pitido molesto persistente tras
+    # recuperarse. La emergencia medica NUNCA se silencia. Configurable por entorno.
+    BUZZER_QUIET_AFTER_CLEAR_S = _env_f("SOMNO_BUZZER_QUIET_S", 30.0)
 
     def __init__(self, buzzer: Buzzer, mqtt: MqttPublisher) -> None:
         self.buzzer = buzzer
@@ -35,6 +49,8 @@ class AlertDispatcher:
         self._emergency_active = False
         self._sound_candidate_level = 0
         self._sound_candidate_since_ts = 0.0
+        # Instante desde el que el conductor esta "despejado" (sin fatiga real).
+        self._clear_since_ts = 0.0
 
     def _apply_hysteresis(self, raw_level: int, emergency: bool) -> int:
         now = time.time()
@@ -77,6 +93,22 @@ class AlertDispatcher:
             return 0
         return level
 
+    def _quiet_when_recovered(self, buzzer_level: int, driver_clear: bool, emergency: bool) -> int:
+        """Calla el buzzer si el conductor lleva >= BUZZER_QUIET_AFTER_CLEAR_S sin
+        senales reales de fatiga. La emergencia medica nunca se silencia."""
+        if emergency:
+            self._clear_since_ts = 0.0
+            return buzzer_level
+        now = time.time()
+        if driver_clear:
+            if self._clear_since_ts == 0.0:
+                self._clear_since_ts = now
+            if (now - self._clear_since_ts) >= self.BUZZER_QUIET_AFTER_CLEAR_S:
+                return 0
+        else:
+            self._clear_since_ts = 0.0
+        return buzzer_level
+
     def _should_publish_mqtt(self, level: int, reasons: List[str], emergency: bool) -> bool:
         if emergency:
             return True
@@ -100,9 +132,11 @@ class AlertDispatcher:
         emergency: bool = False,
         emergency_type: str | None = None,
         fixed_buzzer: bool = False,
+        driver_clear: bool = False,
     ) -> Dict:
         out_level = self._apply_hysteresis(level, emergency)
         buzzer_level = self._delayed_buzzer_level(out_level, emergency)
+        buzzer_level = self._quiet_when_recovered(buzzer_level, driver_clear, emergency)
         self.buzzer.set_level(buzzer_level)
         self.buzzer.set_continuous(bool(fixed_buzzer) and buzzer_level > 0)
         self.mqtt.set_level(out_level)

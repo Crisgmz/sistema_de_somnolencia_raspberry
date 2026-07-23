@@ -8,7 +8,10 @@ from dataclasses import dataclass
 @dataclass
 class Calibration:
     ear_baseline: float = 0.28
-    mar_baseline: float = 0.25
+    # MAR de boca cerrada con la formula actual (aperturas verticales / ancho
+    # comisura-a-comisura) ronda ~0.45. El default anterior (0.25) era de una
+    # formula previa y hacia que la calibracion rechazara los valores reales.
+    mar_baseline: float = 0.45
     tc_baseline_ms: float = 180.0
     fb_baseline_per_min: float = 15.0
     pitch_neutral: float = 0.0
@@ -36,7 +39,7 @@ class Calibration:
     # al rango fisico de Euler [-180,180] como salvaguarda ante valores basura.
     _RANGES = {
         "ear_baseline": (0.15, 0.42),
-        "mar_baseline": (0.08, 0.50),
+        "mar_baseline": (0.20, 0.70),
         "tc_baseline_ms": (80.0, 400.0),
         "fb_baseline_per_min": (5.0, 40.0),
         "pitch_neutral": (-180.0, 180.0),
