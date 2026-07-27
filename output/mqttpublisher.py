@@ -80,6 +80,11 @@ class MqttPublisher(threading.Thread):
             else:
                 client.tls_set()
         client.reconnect_delay_set(min_delay=1, max_delay=30)
+        # LTE: limitar mensajes QoS>0 en vuelo y en cola interna de paho. Sin
+        # limite, tras una desconexion larga paho reenviaba TODO el backlog de
+        # golpe al reconectar (rafaga que saturaba el enlace movil).
+        client.max_inflight_messages_set(10)
+        client.max_queued_messages_set(50)
         client.connect(self.config.mqtt_host, self.config.mqtt_port, keepalive=60)
         client.loop_start()
         self._client = client
@@ -144,8 +149,12 @@ class MqttPublisher(threading.Thread):
         except (TypeError, ValueError) as exc:
             self._last_error = f"json_encode: {exc}"
             return
-        result = self._client.publish(topic, data, qos=self.config.mqtt_qos)
-        now = time.time()
+        # Telemetria periodica: QoS 0 (si se pierde un mensaje, llega el
+        # siguiente en segundos; reintentarla solo congestiona el enlace LTE).
+        # Alertas/emergencias (immediate): QoS configurado (default 1).
+        qos = self.config.mqtt_qos if is_immediate else self.config.mqtt_qos_telemetry
+        result = self._client.publish(topic, data, qos=qos)
+        now = time.monotonic()
         if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
             self._last_error = f"publish_rc={result.rc}"
             print(f"[MQTT] Error publicando en {topic}, rc={result.rc}")
@@ -180,7 +189,7 @@ class MqttPublisher(threading.Thread):
                 pass
 
             interval = self.LEVEL_INTERVAL.get(self._level, 5.0)
-            if self._latest_telemetry and (time.time() - self._last_publish) >= interval:
+            if self._latest_telemetry and (time.monotonic() - self._last_publish) >= interval:
                 self._publish_now(self._latest_telemetry)
                 self._latest_telemetry = {}
 

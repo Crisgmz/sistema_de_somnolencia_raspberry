@@ -19,6 +19,11 @@ except Exception:
 class SupabaseSync(threading.Thread):
     MAX_CONSECUTIVE_FAILURES = 10
     BACKOFF_BASE_S = 2.0
+    # Cap de la cola local: con red caida (o LTE lentisimo) la cola SQLite no
+    # debe crecer sin limite. Al superar el cap se descarta el backlog MAS VIEJO
+    # de las tablas de alta frecuencia; eventos/emergencias/sesiones jamas.
+    MAX_QUEUE_ROWS = 20000
+    PRUNABLE_TABLES = ("telemetry_raw", "metrics_summary")
 
     def __init__(self, config: AppConfig, flush_interval_s: float = 15.0) -> None:
         super().__init__(daemon=True)
@@ -44,8 +49,9 @@ class SupabaseSync(threading.Thread):
         self._ensure_column("conflict_target", "text")
         self.conn.commit()
         self.sb = None
-        self._stats = {"queued": 0, "flushed": 0, "failed": 0, "last_error": "", "last_flush_ts": 0.0}
+        self._stats = {"queued": 0, "flushed": 0, "failed": 0, "dropped": 0, "last_error": "", "last_flush_ts": 0.0}
         self._consecutive_failures = 0
+        self._enqueued_since_prune = 0
         if create_client and self.config.supabase_url and self.config.supabase_key:
             try:
                 self.sb = create_client(self.config.supabase_url, self.config.supabase_key)
@@ -74,9 +80,31 @@ class SupabaseSync(threading.Thread):
                 (table_name, json.dumps(payload), 1 if immediate else 0, op, conflict_target, time.time()),
             )
             self.conn.commit()
+            self._enqueued_since_prune += 1
+            if self._enqueued_since_prune >= 500:
+                self._enqueued_since_prune = 0
+                self._prune_queue_locked()
         self._stats["queued"] += 1
         if immediate:
             self._flush_requested.set()
+
+    def _prune_queue_locked(self) -> None:
+        """Descarta telemetria vieja si la cola supera el cap. Llamar con _db_lock."""
+        total = self.conn.execute("select count(*) from queue").fetchone()[0]
+        excess = int(total) - self.MAX_QUEUE_ROWS
+        if excess <= 0:
+            return
+        placeholders = ",".join("?" for _ in self.PRUNABLE_TABLES)
+        cur = self.conn.execute(
+            f"delete from queue where id in ("
+            f"select id from queue where table_name in ({placeholders}) and immediate = 0 order by id limit ?)",
+            (*self.PRUNABLE_TABLES, excess),
+        )
+        self.conn.commit()
+        dropped = cur.rowcount if cur.rowcount is not None else 0
+        if dropped > 0:
+            self._stats["dropped"] += dropped
+            print(f"[SUPABASE] Cola > {self.MAX_QUEUE_ROWS}: descartadas {dropped} filas de telemetria antigua.")
 
     def enqueue_upsert(self, table_name: str, payload: Dict, conflict_target: str, immediate: bool = False) -> None:
         self.enqueue(table_name, payload, immediate=immediate, op="upsert", conflict_target=conflict_target)
@@ -92,21 +120,54 @@ class SupabaseSync(threading.Thread):
                 rows = self.conn.execute(
                     f"select id, table_name, payload, op, conflict_target from queue {where} order by id limit 200"
                 ).fetchall()
-            flushed_ids: list[int] = []
+            # Agrupar filas CONSECUTIVAS con el mismo destino y enviarlas en UN
+            # solo request (insert/upsert aceptan listas). Antes se enviaba fila
+            # a fila: hasta 200 round-trips por flush, que con latencia LTE
+            # (300-800 ms cada uno) tardaban minutos y la cola nunca vaciaba.
+            groups: list[tuple[tuple, list[int], list[Dict]]] = []
             for row_id, table_name, payload_json, op, conflict_target in rows:
-                payload = json.loads(payload_json)
+                key = (table_name, op, conflict_target)
+                if not groups or groups[-1][0] != key:
+                    groups.append((key, [], []))
+                groups[-1][1].append(row_id)
+                groups[-1][2].append(json.loads(payload_json))
+            flushed_ids: list[int] = []
+            for (table_name, op, conflict_target), ids, payloads in groups:
+                batch_payloads = payloads
+                if op == "upsert" and conflict_target:
+                    # Postgres rechaza un upsert que toca la misma fila dos veces
+                    # en el mismo lote: conservar solo la version MAS RECIENTE
+                    # por clave de conflicto (las anteriores quedan superadas).
+                    latest: dict = {}
+                    for p in payloads:
+                        latest[p.get(conflict_target)] = p
+                    batch_payloads = list(latest.values())
                 try:
                     if op == "upsert":
-                        self.sb.table(table_name).upsert(payload, on_conflict=conflict_target).execute()
+                        self.sb.table(table_name).upsert(batch_payloads, on_conflict=conflict_target).execute()
                     else:
-                        self.sb.table(table_name).insert(payload).execute()
-                    flushed_ids.append(row_id)
-                    self._stats["flushed"] += 1
+                        self.sb.table(table_name).insert(batch_payloads).execute()
+                    flushed_ids.extend(ids)
+                    self._stats["flushed"] += len(ids)
                     self._consecutive_failures = 0
-                except Exception as exc:
-                    self._consecutive_failures += 1
-                    self._stats["failed"] += 1
-                    self._stats["last_error"] = str(exc)
+                except Exception:
+                    # El lote fallo: reintento fila a fila para aislar una fila
+                    # invalida sin bloquear al resto del lote.
+                    for rid, payload in zip(ids, payloads):
+                        try:
+                            if op == "upsert":
+                                self.sb.table(table_name).upsert(payload, on_conflict=conflict_target).execute()
+                            else:
+                                self.sb.table(table_name).insert(payload).execute()
+                            flushed_ids.append(rid)
+                            self._stats["flushed"] += 1
+                            self._consecutive_failures = 0
+                        except Exception as exc:
+                            self._consecutive_failures += 1
+                            self._stats["failed"] += 1
+                            self._stats["last_error"] = str(exc)
+                            if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                                break
                     if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
                         print(f"[SUPABASE] {self._consecutive_failures} fallos consecutivos, pausando flush.")
                         break

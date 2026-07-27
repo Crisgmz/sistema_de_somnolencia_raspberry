@@ -45,10 +45,12 @@ class BocaParametros:
         # movimiento de boca subia el score sin somnolencia (igual que los
         # parpadeos con EAR).
         event = reliable and calibration.calibrated and mar >= thr and mouth_open_ms >= 500.0
+        # Solo MAR (bostezo sostenido) puntua. Conteo y duracion de bostezos son
+        # derivados del mismo gesto: puntuarlos ademas duplicaba la evidencia.
         return {
             "MAR": build_param_output("MAR", mar, normalize_linear(mar, calibration.mar_baseline * 1.1, calibration.mar_baseline * 2.0), event, 4 if event else 0, ts=ts),
-            "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 2.0, 7.0), calibration.calibrated and self.yawn_count >= 4, 5, ts=ts),
-            "YAWN_DUR": build_param_output("YAWN_DUR", float(self.last_yawn_dur), normalize_linear(float(self.last_yawn_dur), 1.0, 3.0), calibration.calibrated and self.last_yawn_dur >= 2.0, 4, ts=ts),
+            "YAWN_FREQ": build_param_output("YAWN_FREQ", float(self.yawn_count), normalize_linear(float(self.yawn_count), 2.0, 7.0), False, 0, ts=ts),
+            "YAWN_DUR": build_param_output("YAWN_DUR", float(self.last_yawn_dur), normalize_linear(float(self.last_yawn_dur), 1.0, 3.0), False, 0, ts=ts),
         }
 
 

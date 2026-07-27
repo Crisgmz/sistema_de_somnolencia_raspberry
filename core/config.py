@@ -19,6 +19,9 @@ class AppConfig:
     mqtt_ws_path: str = "/mqtt"
     mqtt_tls: bool = True
     mqtt_qos: int = 1
+    # QoS de la telemetria periodica (0 = sin reintentos: en LTE intermitente,
+    # reintentar telemetria vieja solo congestiona; las alertas van con mqtt_qos).
+    mqtt_qos_telemetry: int = 0
     mqtt_client_id: str = "raspi-somnoalert"
     mqtt_ca_cert: str = ""
     vehicle_id: str = "vehicle_unknown"
@@ -42,6 +45,7 @@ class AppConfig:
             mqtt_ws_path=os.getenv("MQTT_WS_PATH", "/mqtt"),
             mqtt_tls=tls_raw in {"1", "true", "yes", "on"},
             mqtt_qos=int(os.getenv("MQTT_QOS", "1")),
+            mqtt_qos_telemetry=int(os.getenv("MQTT_QOS_TELEMETRY", "0")),
             mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "raspi-somnoalert"),
             mqtt_ca_cert=os.getenv("MQTT_CA_CERT_PATH", ""),
             vehicle_id=os.getenv("VEHICLE_ID", "vehicle_unknown"),

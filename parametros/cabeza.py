@@ -56,7 +56,6 @@ class CabezaParametros:
         # velocidad instantanea disparaba HEAD_DROP falsos; sobre la ventana el
         # ruido promedia ~0 y solo una caida SOSTENIDA (cabeceo real) la supera.
         self._pitch_win: Deque[Tuple[float, float]] = deque(maxlen=60)
-        self.pitch_hist: Deque[Tuple[float, float]] = deque(maxlen=6000)
         # Semilla temporal para solvePnP: reutilizar la pose previa estabiliza la
         # solucion (menos saltos/ambiguedad frame a frame) y por tanto reduce
         # falsos picos de velocidad de caida y micro-oscilacion.
@@ -135,33 +134,18 @@ class CabezaParametros:
             self.recovery_start_ts = None
             self._recovery_event_pending = True
 
-        self.pitch_hist.append((ts, pitch))
-        while self.pitch_hist and (ts - self.pitch_hist[0][0]) > 6.0:
-            self.pitch_hist.popleft()
-
-        micro_value = 0.0
-        if len(self.pitch_hist) >= 24:
-            t = np.asarray([k for k, _ in self.pitch_hist], dtype=np.float64)
-            x = np.asarray([v for _, v in self.pitch_hist], dtype=np.float64)
-            x = x - np.mean(x)
-            dt = np.median(np.diff(t)) if t.size > 1 else 0.0
-            if dt > 0:
-                spec = np.abs(np.fft.rfft(x))
-                freqs = np.fft.rfftfreq(x.size, d=dt)
-                band = (freqs >= 2.5) & (freqs <= 3.5)
-                total = float(np.sum(spec[1:] ** 2)) if spec.size > 2 else 0.0
-                micro_value = float(np.sum(spec[band] ** 2) / total) if total > 1e-9 else 0.0
-
-        recovery_event = calibration.calibrated and self._recovery_event_pending and self.last_recovery >= 2.3
         self._recovery_event_pending = False
 
+        # Solo PITCH (cabeceo sostenido respecto al neutro calibrado) puntua.
+        # ROLL/YAW/velocidad/recovery/micro-oscilacion tiemblan con solvePnP y
+        # generaban falsos positivos; quedan como telemetria (la emergencia
+        # medica sigue leyendo sus VALORES, no sus eventflags).
         return {
             "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
-            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), calibration.calibrated and abs(angle_delta_deg(roll, calibration.roll_neutral)) >= 32.0, 4, ts=ts),
-            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), calibration.calibrated and abs(angle_delta_deg(yaw, calibration.yaw_neutral)) >= 40.0, 2, ts=ts),
-            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), calibration.calibrated and 25.0 <= velocity <= 130.0, 6, ts=ts),
-            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), recovery_event, 5, ts=ts),
-            "HEAD_MICRO_OSC": build_param_output("HEAD_MICRO_OSC", micro_value, normalize_linear(micro_value, 0.3, 0.8), calibration.calibrated and micro_value >= 0.55, 0, ts=ts),
+            "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), False, 0, ts=ts),
+            "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), False, 0, ts=ts),
+            "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), False, 0, ts=ts),
+            "HEAD_RECOVERY": build_param_output("HEAD_RECOVERY", self.last_recovery, normalize_linear(self.last_recovery, 0.8, 3.5), False, 0, ts=ts),
         }
 
 

@@ -62,12 +62,13 @@ class FacialParametros:
             terms.append(x_mirror + y_diff)
         asym = float(np.mean(terms)) if terms else 0.0
 
-        emergency = calibration.calibrated and asym >= (calibration.asymmetry_base * 3.0)
-
+        # Telemetria pura: LANDMARK_STABILITY alimenta el gate de calidad de
+        # rostro (por valor) y FACIAL_ASYMMETRY las "sospechas" informativas del
+        # detector de emergencia; no puntuan fatiga ni disparan emergencia aqui.
         return {
-            "LANDMARK_STABILITY": build_param_output("LANDMARK_STABILITY", stability, normalize_linear(1.0 - stability, 0.1, 0.7), calibration.calibrated and stability <= 0.35, 4, ts=ts),
-            "MUSCLE_TONE": build_param_output("MUSCLE_TONE", tone_drop, normalize_linear(tone_drop, 0.05, 0.35), calibration.calibrated and tone_drop >= 0.2, 3, ts=ts),
-            "FACIAL_ASYMMETRY": build_param_output("FACIAL_ASYMMETRY", asym, normalize_linear(asym, calibration.asymmetry_base * 1.3, calibration.asymmetry_base * 3.5), calibration.calibrated and asym >= (calibration.asymmetry_base * 2.0), 0, emergency, "STROKE_PATTERN" if emergency else None, ts),
+            "LANDMARK_STABILITY": build_param_output("LANDMARK_STABILITY", stability, normalize_linear(1.0 - stability, 0.1, 0.7), False, 0, ts=ts),
+            "MUSCLE_TONE": build_param_output("MUSCLE_TONE", tone_drop, normalize_linear(tone_drop, 0.05, 0.35), False, 0, ts=ts),
+            "FACIAL_ASYMMETRY": build_param_output("FACIAL_ASYMMETRY", asym, normalize_linear(asym, calibration.asymmetry_base * 1.3, calibration.asymmetry_base * 3.5), False, 0, ts=ts),
         }
 
 

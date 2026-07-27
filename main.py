@@ -13,9 +13,7 @@ el interprete del venv (.venv/bin/python):
 from __future__ import annotations
 
 import os
-import queue
 import signal
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -50,7 +48,6 @@ from core.config import AppConfig
 from engine.emergencydetector import detect_emergency
 from engine.corroboration import LevelStabilizer, StabilizerConfig, family_of
 from core.eventstore import EventStore
-from core.scorestate import ScoreStateStore
 from core.calibrationstore import CalibrationStore
 from core.common_types import CircularMeanDeg, angle_delta_deg
 from engine.fatiguescore import DynamicFatigueScore
@@ -59,68 +56,31 @@ from parametros.boca import BocaParametros
 from parametros.cabeza import CabezaParametros
 from parametros.contexto import ContextoParametros
 from parametros.facial import FacialParametros
-from parametros.manos import ManosParametros
 from parametros.ojos import OjosParametros
 from engine.ruleengine import RuleEngine
-from somnolencia_core import BOCA, OJO_DER, OJO_IZQ, eye_metrics, fuse_ear, get_ear, get_mar
+from core.vision import BOCA, OJO_DER, OJO_IZQ, eye_metrics, fuse_ear, get_mar
 from storage.supabasesync import SupabaseSync
 from storage.session_recorder import SessionRecorder, build_record
+from storage.video_recorder import VideoRecorder
 from camera_setup import describe_camera_environment, list_opencv_candidates, setup_camera
 
 
 @dataclass
 class RuntimeState:
     session_id: str
+    # Reloj de PARED (para timestamps externos: DB, MQTT, ISO).
     started_at: float
     last_minute_flush: float
+    # Reloj MONOTONICO (para toda la logica interna de ventanas/cadencias).
+    # En la Raspberry sin RTC, NTP puede saltar el reloj de pared en medio de
+    # la sesion (tipico con LTE, donde el modem tarda en dar red); el reloj
+    # monotonico nunca salta.
+    started_mono: float = 0.0
     last_telemetry_persist: float = 0.0
     last_session_sync: float = 0.0
-    last_score_state_persist: float = 0.0
-    last_score_state_value: int = -1
-    # Instante en que arranca la calibracion REAL: el primer frame con un rostro
-    # estable y de frente tras el calentamiento de camara. La ventana de 5 min se
-    # cuenta desde aqui, NO desde el boot (donde la camara aun se esta asentando).
+    # Instante (monotonico) en que arranca la calibracion REAL: el primer frame
+    # con un rostro estable y de frente tras el calentamiento de camara.
     calib_anchor_ts: float = 0.0
-
-
-class HandsWorker(threading.Thread):
-    def __init__(self) -> None:
-        super().__init__(daemon=True)
-        self._stop_event = threading.Event()
-        self._in_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=1)
-        self._latest = None
-        self._lock = threading.Lock()
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-
-    def submit(self, rgb_frame: np.ndarray) -> None:
-        try:
-            self._in_queue.put_nowait(rgb_frame)
-        except queue.Full:
-            pass
-
-    def latest(self):
-        with self._lock:
-            return self._latest
-
-    def run(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                rgb = self._in_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            out = self.hands.process(rgb)
-            with self._lock:
-                self._latest = out
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self.join(timeout=1.0)
-        self.hands.close()
 
 
 class SomnolenciaSystem:
@@ -133,15 +93,14 @@ class SomnolenciaSystem:
     # (640x480), lo que ESTIRABA la cara ~33% y distorsionaba EAR/MAR/asimetria y
     # los puntos 2D de solvePnP (pose inestable). Nunca volver a un tamano fijo.
     MP_PROC_LONG = 320
-    HANDS_EVERY_N_FRAMES = 4
     DISPLAY_INTERVAL_S = 1.0 / 15.0  # limita display a 15 fps maximo
 
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config
         self.calibration = Calibration()
-        # Modo lentes: manual por entorno (la autodeteccion fiable de lentes no
-        # es viable). Ajusta umbrales oculares. El modo noche se autodetecta por
-        # iluminacion en parametros/contexto.py.
+        # Modo lentes: manual por entorno, SOLO informativo (telemetria). Los
+        # umbrales oculares ya NO cambian con lentes: el baseline calibrado por
+        # mediana absorbe el offset de la montura y el umbral queda estable.
         self.calibration.glassesmode = os.getenv("SOMNO_GLASSES", "0").strip().lower() in ("1", "true", "yes", "on")
         # Persistencia de calibracion por conductor: si hay una reciente y valida
         # se restaura y se evita la ventana de 5 min desprotegida al arrancar.
@@ -169,22 +128,18 @@ class SomnolenciaSystem:
                 )
             elif pose_untouched:
                 print("[CALIB] Calibracion guardada invalida (neutros de pose en 0), se recalibrara")
-        self.event_store = EventStore(config.sqlite_queue_path)
+        self.event_store = EventStore()
+        # El score SIEMPRE arranca en 0: restaurar un score viejo obligaba a
+        # toda una maquinaria defensiva (cap de restauracion, exigir evento
+        # fresco) para evitar alertas fantasma al encender. Si el conductor
+        # esta fatigado de verdad, la evidencia real lo sube en segundos; el
+        # historico vive en Supabase (sessions.max_fatigue).
         self.score = DynamicFatigueScore()
-        self.score_state_store = ScoreStateStore(config.sqlite_queue_path, config.vehicle_id, config.driver_id)
-        saved_score_state = self.score_state_store.load()
-        if saved_score_state:
-            self.score.restore(saved_score_state)
-            print(
-                "[SCORE] Estado restaurado "
-                f"score={self.score.score} max={self.score.max_score_seen} alertas={self.score.alert_count}"
-            )
 
         self.ojos = OjosParametros()
         self.boca = BocaParametros()
         self.cabeza = CabezaParametros()
         self.facial = FacialParametros()
-        self.manos = ManosParametros()
         self.contexto = ContextoParametros()
 
         self.mqtt = MqttPublisher(config)
@@ -208,24 +163,6 @@ class SomnolenciaSystem:
         # completa): a 320px los ojos quedan en ~13px y el EAR/landmarks son puro
         # ruido -> falsos cierres e inestabilidad. A 640px hay el doble de detalle.
         self.mp_proc_long = int(os.getenv("SOMNO_MP_LONG", "640"))
-        # Modo demo: el CIERRE DE OJOS y el bostezo son los detectores robustos.
-        # Los eventos de POSE (solvePnP) y de MIRADA/tasa-de-parpadeo tiemblan con
-        # camara/luz marginal y generaban falsos que subian el score sin cerrar
-        # los ojos. En modo demo se de-priorizan (no puntuan). Se puede apagar con
-        # SOMNO_DEMO_MODE=0 para el sistema completo (informe/tesis).
-        self.demo_mode = os.getenv("SOMNO_DEMO_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
-        # En modo demo puntuan solo los detectores CANONICOS de cierre de ojos
-        # (EYE_CLOSED_MS = microsueno; PERCLOS = % de cierre, sube gradual) y el
-        # bostezo. Se suprimen: pose/mirada (temblorosos) y las metricas de
-        # FORMA de parpadeo (BLINK_TC/amplitud/velocidad-reapertura), que median
-        # el MISMO cierre y apilaban ~+14 extra por cierre -> el score saltaba de
-        # golpe. Asi el score sube proporcional a la duracion del cierre, no a saltos.
-        self.demo_suppressed = {
-            "HEAD_DROP_VELOCITY", "PITCH", "ROLL", "YAW", "HEAD_RECOVERY",
-            "HEAD_MICRO_OSC", "FIXATION", "IBI", "BLINK_FB", "MUSCLE_TONE",
-            "LANDMARK_STABILITY", "FACIAL_ASYMMETRY",
-            "BLINK_TC", "BLINK_AMPLITUDE", "REOPEN_SPEED", "EAR",
-        }
         # Periodo de gracia ante perdida breve de rostro: durante estos segundos
         # NO se decae el score ni se relaja la histeresis del nivel, de modo que
         # quitar la cara y volver a ponerla no borra los datos acumulados.
@@ -267,21 +204,23 @@ class SomnolenciaSystem:
         self._distraction_since: float | None = None
         self._distraction_reported = False
         self._distraction_last_chirp = 0.0
-        self.hands_enabled = os.getenv("SOMNO_HANDS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-        self.hands_worker = HandsWorker() if self.hands_enabled else None
         self.alert_memory = AlertMemory()
         self._active_param_events: dict[str, float] = {}
         self._last_emergency_type: str | None = None
         self._last_emergency_started_at: float | None = None
         self._minute_samples: list[dict] = []
+        # Muestras crudas recogidas durante la ventana de calibracion; al
+        # finalizar se derivan baselines ROBUSTOS por mediana (inmunes a
+        # parpadeos/bostezos puntuales y al offset de la montura con lentes).
+        self._calib_ear_samples: list[float] = []
+        self._calib_mar_samples: list[float] = []
+        self._calib_asym_samples: list[float] = []
 
-        # Iris/refine_landmarks: refina parpados+iris -> EAR mas estable y menos
-        # falsos cierres. Cuesta algo de CPU; si el FPS cae mucho en la Pi se
-        # puede desactivar con SOMNO_REFINE_LANDMARKS=0.
-        self.refine_landmarks = os.getenv("SOMNO_REFINE_LANDMARKS", "1").strip().lower() in ("1", "true", "yes", "on")
+        # refine_landmarks SIEMPRE activo: refina parpados+iris -> EAR estable
+        # y menos falsos cierres. Es la clave de la robustez con lentes.
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            refine_landmarks=self.refine_landmarks,
+            refine_landmarks=True,
             max_num_faces=1,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -624,21 +563,23 @@ class SomnolenciaSystem:
             self._last_emergency_type = None
             self._last_emergency_started_at = None
 
-    def _persist_score_state(self, state: RuntimeState, ts: float) -> None:
-        score_value = int(self.score.score)
-        should_save = (
-            state.last_score_state_persist == 0.0
-            or score_value != state.last_score_state_value
-            or (ts - state.last_score_state_persist) >= 5.0
-        )
-        if not should_save:
-            return
-        self.score_state_store.save(self.score.snapshot(), ts=ts)
-        state.last_score_state_persist = ts
-        state.last_score_state_value = score_value
-
     def _finalize_calibration(self) -> None:
-        """Cierra la calibracion: valida/clampea baselines y los persiste."""
+        """Cierra la calibracion: baselines robustos por mediana, valida y persiste."""
+        ears = np.asarray(self._calib_ear_samples, dtype=np.float64)
+        if ears.size:
+            # Descartar la cola baja (parpadeos, ~5-8% de los frames) y tomar la
+            # mediana del resto: estimador robusto del EAR de ojo abierto que
+            # absorbe el offset propio de cada conductor (incluida la montura de
+            # los lentes) sin gates circulares sobre el propio baseline.
+            p20 = float(np.percentile(ears, 20.0))
+            open_samples = ears[ears >= p20]
+            self.calibration.ear_baseline = float(np.median(open_samples if open_samples.size else ears))
+        if self._calib_mar_samples:
+            # La boca esta cerrada la mayor parte del tiempo: la mediana es el
+            # MAR de reposo aunque haya bostezos/habla en la ventana.
+            self.calibration.mar_baseline = float(np.median(np.asarray(self._calib_mar_samples, dtype=np.float64)))
+        if self._calib_asym_samples:
+            self.calibration.asymmetry_base = float(np.median(np.asarray(self._calib_asym_samples, dtype=np.float64)))
         corrected = self.calibration.sanitize()
         self.calibration.calibrated = True
         if corrected:
@@ -747,13 +688,9 @@ class SomnolenciaSystem:
         self.mqtt.start()
         self.supabase.start()
         self.rule_engine.start()
-        if self.hands_worker:
-            self.hands_worker.start()
 
     def stop(self) -> None:
         self.rule_engine.stop()
-        if self.hands_worker:
-            self.hands_worker.stop()
         self.mqtt.stop()
         self.supabase.stop()
         self.buzzer.stop()
@@ -766,12 +703,11 @@ class SomnolenciaSystem:
             except Exception:
                 pass
         self.calibration_store.close()
-        self.score_state_store.close()
         self.event_store.close()
 
     def run(self) -> None:
         preferred = int(self.cfg.camera_index)
-        print(f"[INFO] MP lado_mayor={self.MP_PROC_LONG} (aspecto preservado) | manos={'ON' if self.hands_enabled else 'OFF'} | display={'ON' if self.display_enabled else 'OFF'}")
+        print(f"[INFO] MP lado_mayor={self.MP_PROC_LONG} (aspecto preservado) | display={'ON' if self.display_enabled else 'OFF'}")
         print(f"[INFO] Abriendo camara (index preferido={preferred})...")
         camera_kind = ""
         camera = None
@@ -803,8 +739,17 @@ class SomnolenciaSystem:
                 )
         print("[INFO] Esperando primer frame...")
 
-        state = RuntimeState(session_id=f"ses_{uuid.uuid4().hex[:12]}", started_at=time.time(), last_minute_flush=time.time())
+        state = RuntimeState(
+            session_id=f"ses_{uuid.uuid4().hex[:12]}",
+            started_at=time.time(),
+            last_minute_flush=time.time(),
+            started_mono=time.monotonic(),
+        )
         self.recorder = SessionRecorder(state.session_id)
+        # Grabacion de video EN VIVO (SOMNO_RECORD_VIDEO=1): escribe el frame
+        # crudo que ve el detector mientras el sistema opera normal; el clip
+        # alimenta tools/validate_video.py sin una fase aparte de grabacion.
+        self.video_recorder = VideoRecorder(state.session_id)
 
         # SIGTERM (systemd stop, kill) debe disparar shutdown limpio.
         def _sigterm_handler(_signum, _frame):
@@ -815,13 +760,13 @@ class SomnolenciaSystem:
 
         self.start_threads()
 
-        last_fps_ts = time.time()
-        last_health_log_ts = time.time()
+        last_fps_ts = time.monotonic()
+        last_health_log_ts = time.monotonic()
         last_display_ts = 0.0
         fps_count = 0
         fps = 0.0
         first_frame_ok = False
-        first_frame_deadline = time.time() + 10.0
+        first_frame_deadline = time.monotonic() + 10.0
         head_down_start_ts: float | None = None
         frame_idx = 0
         last_score_out = {"fatigue_score": 0, "level": 0, "label": "NORMAL", "max_fatigue": 0, "alert_count": 0}
@@ -833,7 +778,7 @@ class SomnolenciaSystem:
             "score": last_score_out,
             "alerts": {"active": False, "level": 0, "reasons": []},
             "emergency": {"emergencyflag": False, "emergencytype": None, "reasons": [], "fixedbuzzer": False},
-            "alert_memory": self.alert_memory.snapshot(time.time()),
+            "alert_memory": self.alert_memory.snapshot(time.monotonic()),
             "sys": {"fps": 0.0, "status": "starting"},
         }
 
@@ -844,7 +789,7 @@ class SomnolenciaSystem:
             while True:
                 ok, frame = read_frame(camera)
                 if not ok or frame is None:
-                    if time.time() >= first_frame_deadline and not first_frame_ok:
+                    if time.monotonic() >= first_frame_deadline and not first_frame_ok:
                         raise RuntimeError(
                             "La camara se abrio, pero no entrega frames en 10s. "
                             "Revisa CAMERA_INDEX, permisos de video y que ningun otro proceso use la camara."
@@ -855,17 +800,20 @@ class SomnolenciaSystem:
                     first_frame_ok = True
                     print("[INFO] Primer frame recibido. Pipeline en ejecucion.")
 
-                ts = time.time()
+                # ts (monotonico): TODA la logica interna de ventanas/duraciones.
+                # wall_ts (pared): SOLO timestamps externos (DB, MQTT, ISO).
+                ts = time.monotonic()
+                wall_ts = time.time()
                 frame_idx += 1
                 # Pantalla: frame original rotado segun preferencia. MediaPipe: frame optimizado (sin recorte).
                 display_frame = self._apply_rotation(frame, self.rotation_index)
+                # Grabar ANTES de dibujar cualquier overlay: el clip debe ser el
+                # frame limpio que procesa MediaPipe, no el HUD.
+                self.video_recorder.write(display_frame)
                 mp_frame = self._build_mediapipe_frame(display_frame)
                 h, w = display_frame.shape[:2]
                 mp_h, mp_w = mp_frame.shape[:2]
                 face_out = self.face_mesh.process(mp_frame)
-                if self.hands_worker and frame_idx % max(1, self.HANDS_EVERY_N_FRAMES) == 0:
-                    self.hands_worker.submit(mp_frame)
-                hand_out = self.hands_worker.latest() if self.hands_worker else None
 
                 param_outputs = []
                 pitch = yaw = roll = 0.0
@@ -978,7 +926,6 @@ class SomnolenciaSystem:
                     out_ojos = self.ojos.update(ts, ear, left_center, right_center, self.calibration, pose_reliable=ocular_reliable)
                     out_boca = self.boca.update(ts, mar, self.calibration, pose_reliable=mouth_reliable)
                     out_facial = self.facial.update(ts, lm, mp_w, mp_h, self.calibration, self.rotation_index)
-                    out_manos = self.manos.update(ts, hand_out, left_center, right_center, mp_w, mp_h, self.calibration, self.rotation_index)
 
                     fixation_value = out_ojos["FIXATION"]["value"]
                     asym_value = out_facial["FACIAL_ASYMMETRY"]["value"]
@@ -987,20 +934,10 @@ class SomnolenciaSystem:
                     param_outputs.extend(list(out_boca.values()))
                     param_outputs.extend(list(out_cabeza.values()))
                     param_outputs.extend(list(out_facial.values()))
-                    param_outputs.extend(list(out_manos.values()))
 
                 has_event = any(p.get("eventflag", False) for p in param_outputs)
                 out_contexto = self.contexto.update(ts, display_frame, has_event, self.calibration)
                 param_outputs.extend(list(out_contexto.values()))
-
-                # Modo demo: anula el eventflag de los parametros de pose/mirada
-                # (temblorosos) para que NO puntuen. El cierre de ojos, PERCLOS,
-                # EAR sostenido y bostezo siguen intactos. No afecta calibracion ni
-                # face_quality (que leen valores, no eventflags) ni la emergencia.
-                if self.demo_mode:
-                    for _p in param_outputs:
-                        if _p.get("paramid") in self.demo_suppressed:
-                            _p["eventflag"] = False
 
                 # Gate de calidad de rostro: MediaPipe a veces detecta un "rostro"
                 # espurio en texturas (p.ej. una pared) o entrega landmarks
@@ -1010,7 +947,7 @@ class SomnolenciaSystem:
                 # criterio: no calibrar sobre frames basura. Umbral configurable.
                 landmark_stability = float(self._param_value(param_outputs, "LANDMARK_STABILITY", 0.0)) if face_detected else 0.0
                 face_quality_ok = face_detected and landmark_stability >= self.face_quality_min
-                camera_warm = (ts - state.started_at) >= self.camera_warmup_s
+                camera_warm = (ts - state.started_mono) >= self.camera_warmup_s
                 # Durante el calentamiento de camara NO se puntua ni se detecta
                 # emergencia, aunque la calibracion este restaurada: los primeros
                 # segundos tras el boot (autofoco/exposicion/AWB) son basura y
@@ -1022,8 +959,8 @@ class SomnolenciaSystem:
                     # La calibracion solo INICIA y AVANZA con la camara ya asentada
                     # (tras el calentamiento) y un rostro ESTABLE de frente. Asi no
                     # se calibra sobre los primeros segundos de arranque (yaw
-                    # torcido, EAR/MAR basura). La ventana de 5 min se ancla al
-                    # primer frame bueno, no al boot.
+                    # torcido, EAR/MAR basura). La ventana se ancla al primer
+                    # frame bueno, no al boot.
                     if camera_warm and face_quality_ok:
                         if state.calib_anchor_ts == 0.0:
                             state.calib_anchor_ts = ts
@@ -1032,24 +969,27 @@ class SomnolenciaSystem:
                         self.calibration.pitch_neutral = self._pitch_mean.update(pitch)
                         self.calibration.roll_neutral = self._roll_mean.update(roll)
                         self.calibration.yaw_neutral = self._yaw_mean.update(yaw)
-                        # EAR/MAR/asimetria son sensibles al ruido: solo con luz
-                        # suficiente y rechazando outliers por PLAUSIBILIDAD (un
-                        # parpadeo/bostezo no debe sesgar el baseline).
+                        # Muestras crudas con luz suficiente y rango fisicamente
+                        # plausible; el baseline se deriva por MEDIANA al
+                        # finalizar (robusto a parpadeos/bostezos sin gates
+                        # circulares sobre el propio baseline).
                         if light_ok:
-                            # EAR: solo ojo abierto (descarta parpadeos, ~0.75*baseline).
-                            if 0.12 <= ear <= 0.45 and ear >= 0.75 * self.calibration.ear_baseline:
-                                self.calibration.ear_baseline = 0.99 * self.calibration.ear_baseline + 0.01 * ear
-                            # MAR: solo boca cerrada (descarta bostezos/habla).
-                            # Banda relativa al baseline (rechaza aperturas) con
-                            # piso/techo absolutos plausibles para la formula actual
-                            # (boca cerrada ~0.35-0.55; un bostezo supera 0.7).
-                            if 0.15 <= mar <= self.calibration.mar_baseline * 1.4:
-                                self.calibration.mar_baseline = 0.99 * self.calibration.mar_baseline + 0.01 * mar
-                            # Asimetria facial de reposo del conductor (descarta ruido).
+                            if 0.08 <= ear <= 0.50:
+                                self._calib_ear_samples.append(float(ear))
+                            if 0.15 <= mar <= 0.90:
+                                self._calib_mar_samples.append(float(mar))
                             if 0.0 < asym_value < 0.30:
-                                self.calibration.asymmetry_base = 0.99 * self.calibration.asymmetry_base + 0.01 * asym_value
-                    calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "300"))
-                    if state.calib_anchor_ts > 0.0 and (ts - state.calib_anchor_ts) >= calibration_seconds:
+                                self._calib_asym_samples.append(float(asym_value))
+                    # 90 s bastan para una mediana estable (~1300 muestras a 15
+                    # FPS); la ventana anterior de 5 min dejaba el sistema
+                    # desprotegido y daba mas tiempo a contaminarse.
+                    calibration_seconds = float(os.getenv("CALIBRATION_SECONDS", "90"))
+                    enough_samples = len(self._calib_ear_samples) >= 150
+                    if (
+                        state.calib_anchor_ts > 0.0
+                        and (ts - state.calib_anchor_ts) >= calibration_seconds
+                        and enough_samples
+                    ):
                         self._finalize_calibration()
 
                 for p in param_outputs:
@@ -1141,8 +1081,6 @@ class SomnolenciaSystem:
                             "pitch_delta": pitch_delta,
                             "roll": roll,
                             "yaw": yaw,
-                            "head_micro_osc": pv.get("HEAD_MICRO_OSC", 0.0),
-                            "landmark_stability": pv.get("LANDMARK_STABILITY", 1.0),
                             # Solo se considera asimetria (ictus) con cara frontal
                             # fiable; y con umbral CALIBRADO al conductor, no fijo.
                             "facial_asymmetry": pv.get("FACIAL_ASYMMETRY", 0.0) if ocular_reliable else 0.0,
@@ -1160,22 +1098,21 @@ class SomnolenciaSystem:
                          "face_out": True, "yaw_justified": False}
                     )
                 else:
-                    emergency = {"emergencyflag": False, "emergencytype": None, "reasons": [], "fixedbuzzer": False}
+                    emergency = {"emergencyflag": False, "emergencytype": None, "reasons": [], "fixedbuzzer": False, "suspicions": []}
                 if face_quality_ok and eye_closed_ms >= 1500.0 and int(score_out.get("level", 0)) < 2:
                     reasons = list(score_out.get("reasons", []))
                     if "EYE_CLOSED_MS_FAST" not in reasons:
                         reasons.append("EYE_CLOSED_MS_FAST")
                     score_out = {**score_out, "level": 2, "label": self.score.level_label(2), "reasons": reasons}
-                self._persist_score_state(state, ts)
 
                 fps_count += 1
-                if time.time() - last_fps_ts >= 1.0:
-                    fps = fps_count / max(1e-3, time.time() - last_fps_ts)
+                if ts - last_fps_ts >= 1.0:
+                    fps = fps_count / max(1e-3, ts - last_fps_ts)
                     fps_count = 0
-                    last_fps_ts = time.time()
-                if time.time() - last_health_log_ts >= 10.0:
+                    last_fps_ts = ts
+                if ts - last_health_log_ts >= 10.0:
                     print(f"[INFO] Sistema activo | FPS={fps:.1f} | nivel={score_out['level']} | score={score_out['fatigue_score']}")
-                    last_health_log_ts = time.time()
+                    last_health_log_ts = ts
 
                 alert_memory = self.alert_memory.update(
                     ts=ts,
@@ -1186,7 +1123,7 @@ class SomnolenciaSystem:
                 telemetry = {
                     "v": self.cfg.vehicle_id,
                     "d": self.cfg.driver_id,
-                    "ts": int(ts),
+                    "ts": int(wall_ts),
                     "session_id": state.session_id,
                     "score": score_out,
                     "alerts": {"active": score_out["level"] > 0, "level": score_out["level"], "reasons": score_out.get("reasons", [])},
@@ -1241,12 +1178,9 @@ class SomnolenciaSystem:
                 }
 
                 # Senal de "conductor despejado" para el auto-silencio del buzzer:
-                # rostro fiable y SIN eventos reales de fatiga en curso. Se ignoran
-                # los parametros de contexto (circadiano, tiempo en tarea, etc.) que
-                # estan "activos" de forma permanente sin implicar somnolencia actual.
-                CONTEXT_PARAMS = {"CIRCADIAN", "TIME_ON_TASK", "MONOTONY", "ILLUMINATION"}
-                realtime_events = [p for p in active_event_params if p not in CONTEXT_PARAMS]
-                driver_clear = bool(face_quality_ok) and not realtime_events
+                # rostro fiable y SIN eventos de fatiga en curso (tras la poda,
+                # solo las 4 senales con peso generan eventos).
+                driver_clear = bool(face_quality_ok) and not active_event_params
 
                 telemetry = self.dispatcher.dispatch(
                     level=int(score_out["level"]),
@@ -1259,18 +1193,20 @@ class SomnolenciaSystem:
                     face_present=bool(face_detected),
                 )
 
-                self.recorder.append(ts, build_record(ts, telemetry, pv))
-                self._append_minute_sample(ts, param_outputs, score_out)
+                # Persistencia: cadencias con reloj monotonico (ts), timestamps
+                # de los payloads con reloj de pared (wall_ts).
+                self.recorder.append(wall_ts, build_record(wall_ts, telemetry, pv))
+                self._append_minute_sample(wall_ts, param_outputs, score_out)
                 if state.last_session_sync == 0.0 or (ts - state.last_session_sync) >= 15.0:
-                    self._sync_session(state, ts, score_out, is_final=False)
+                    self._sync_session(state, wall_ts, score_out, is_final=False)
                     state.last_session_sync = ts
                 persist_immediate = bool(emergency.get("emergencyflag")) or int(score_out.get("level", 0)) >= 3
                 if state.last_telemetry_persist == 0.0 or persist_immediate or (ts - state.last_telemetry_persist) >= 2.0:
-                    self._persist_telemetry(telemetry, ts, immediate=persist_immediate)
+                    self._persist_telemetry(telemetry, wall_ts, immediate=persist_immediate)
                     state.last_telemetry_persist = ts
-                self._persist_param_events(telemetry, param_outputs, score_out, ts)
-                self._persist_emergency(telemetry, emergency, ts)
-                self._flush_minute_summary(state, ts, telemetry, force=False)
+                self._persist_param_events(telemetry, param_outputs, score_out, wall_ts)
+                self._persist_emergency(telemetry, emergency, wall_ts)
+                self._flush_minute_summary(state, wall_ts, telemetry, force=False)
                 last_score_out = score_out
                 last_telemetry = telemetry
 
@@ -1296,7 +1232,8 @@ class SomnolenciaSystem:
             shutdown_ts = time.time()
             if getattr(self, "recorder", None) is not None:
                 self.recorder.close()
-            self.score_state_store.save(self.score.snapshot(), ts=shutdown_ts)
+            if getattr(self, "video_recorder", None) is not None:
+                self.video_recorder.close()
             self._flush_minute_summary(state, shutdown_ts, last_telemetry, force=True)
             self._sync_session(state, shutdown_ts, last_score_out, is_final=True)
             if camera_kind == "opencv" and camera is not None:

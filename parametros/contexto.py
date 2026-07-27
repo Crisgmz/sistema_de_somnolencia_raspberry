@@ -36,11 +36,14 @@ class ContextoParametros:
         illumination = float(np.mean(gray) / 255.0)
         calibration.nightmode = illumination < 0.28
 
+        # Telemetria pura: el contexto (hora, tiempo en tarea, monotonia, luz)
+        # informa al panel pero NO puntua: puntuar contexto disparaba alertas
+        # sin ninguna evidencia fisiologica del conductor.
         return {
-            "TIME_ON_TASK": build_param_output("TIME_ON_TASK", time_on_task_min, normalize_linear(time_on_task_min, 60.0, 180.0), calibration.calibrated and time_on_task_min >= 120.0, 2, ts=ts),
-            "CIRCADIAN": build_param_output("CIRCADIAN", circadian_mult, normalize_linear(circadian_mult, 1.0, 1.4), calibration.calibrated and circadian_mult > 1.0, 0, ts=ts),
-            "MONOTONY": build_param_output("MONOTONY", monotony, normalize_linear(monotony, 2.0, 12.0), calibration.calibrated and monotony >= 5.0, 2, ts=ts),
-            "ILLUMINATION": build_param_output("ILLUMINATION", illumination, normalize_linear(1.0 - illumination, 0.3, 0.85), calibration.calibrated and illumination < 0.15, 1, ts=ts),
+            "TIME_ON_TASK": build_param_output("TIME_ON_TASK", time_on_task_min, normalize_linear(time_on_task_min, 60.0, 180.0), False, 0, ts=ts),
+            "CIRCADIAN": build_param_output("CIRCADIAN", circadian_mult, normalize_linear(circadian_mult, 1.0, 1.4), False, 0, ts=ts),
+            "MONOTONY": build_param_output("MONOTONY", monotony, normalize_linear(monotony, 2.0, 12.0), False, 0, ts=ts),
+            "ILLUMINATION": build_param_output("ILLUMINATION", illumination, normalize_linear(1.0 - illumination, 0.3, 0.85), False, 0, ts=ts),
         }
 
 

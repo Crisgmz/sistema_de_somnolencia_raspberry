@@ -1,3 +1,10 @@
 .env
 __pycache__/
 *.pyc
+.DS_Store
+.venv/
+.venv.roto.bak/
+somnolencia_queue.db
+somnolencia_queue.db-shm
+somnolencia_queue.db-wal
+recordings/

@@ -53,7 +53,7 @@ class AlertDispatcher:
         self._clear_since_ts = 0.0
 
     def _apply_hysteresis(self, raw_level: int, emergency: bool) -> int:
-        now = time.time()
+        now = time.monotonic()
         if emergency:
             self._emergency_active = True
             self._effective_level = 4
@@ -84,7 +84,7 @@ class AlertDispatcher:
         if emergency:
             return level
 
-        now = time.time()
+        now = time.monotonic()
         if level != self._sound_candidate_level:
             self._sound_candidate_level = level
             self._sound_candidate_since_ts = now
@@ -99,7 +99,7 @@ class AlertDispatcher:
         if emergency:
             self._clear_since_ts = 0.0
             return buzzer_level
-        now = time.time()
+        now = time.monotonic()
         if driver_clear:
             if self._clear_since_ts == 0.0:
                 self._clear_since_ts = now
@@ -112,7 +112,7 @@ class AlertDispatcher:
     def _should_publish_mqtt(self, level: int, reasons: List[str], emergency: bool) -> bool:
         if emergency:
             return True
-        now = time.time()
+        now = time.monotonic()
         signature = (level, tuple(sorted(reasons)))
         if signature != self._last_mqtt_signature:
             self._last_mqtt_signature = signature
@@ -175,7 +175,7 @@ class AlertDispatcher:
     def _should_notify_supervisor(self, level: int, emergency: bool, reasons: list) -> bool:
         if not (bool(emergency) or level >= 3):
             return False
-        now = time.time()
+        now = time.monotonic()
         sig = (level, bool(emergency))
         if sig == self._last_supervisor_sig and (now - self._last_supervisor_ts) < self.SUPERVISOR_COOLDOWN_S:
             return False

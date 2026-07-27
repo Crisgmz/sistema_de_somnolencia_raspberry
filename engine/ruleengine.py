@@ -1,10 +1,16 @@
-"""Rule Engine en hilo separado para ventanas 5/30/60 min."""
+"""Rule Engine en hilo separado: reglas de ventana sobre las 4 senales con peso.
+
+Tras la poda (docs/PLAN_TRABAJO_PRECISION.md) solo generan eventos:
+EYE_CLOSED_MS (microsueno), PERCLOS, MAR (bostezo sostenido) y PITCH (cabeceo).
+Las reglas de contexto (monotonia/tiempo en tarea) se eliminaron: forzaban
+nivel 2 sin ninguna evidencia fisiologica del conductor.
+"""
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from core.eventstore import EventStore
 
@@ -17,7 +23,6 @@ class RuleEngine(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._latest: Dict = {"forced_min_level": 0, "reasons": []}
-        self._uninterrupted_start_ts: Optional[float] = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -34,51 +39,38 @@ class RuleEngine(threading.Thread):
     def _evaluate(self, now_ts: float) -> Dict:
         win_5 = self.event_store.window(now_ts, 5 * 60)
         win_30 = self.event_store.window(now_ts, 30 * 60)
-        win_60 = self.event_store.window(now_ts, 60 * 60)
         forced_level = 0
         reasons: List[str] = []
 
-        ear_2s = any(
-            e.get("paramid") == "BLINK_TC" and float(e.get("value", 0.0)) >= 2000.0 and bool(e.get("eventflag"))
+        # Cierre ocular >=2 s reciente: emergencia (ademas del pipeline medico).
+        long_closure = any(
+            e.get("paramid") == "EYE_CLOSED_MS" and float(e.get("value", 0.0)) >= 2000.0 and bool(e.get("eventflag"))
             for e in win_5
         )
-        if ear_2s:
+        if long_closure:
             forced_level = max(forced_level, 4)
-            reasons.append("EAR_2S_RULE")
+            reasons.append("EYE_CLOSED_2S_RULE")
 
-        if self._count(win_30, "BLINK_TC") >= 6 and self._count(win_30, "PERCLOS") >= 4:
+        # Fatiga acumulada cruzada: PERCLOS recurrente + microsuenos en 30 min.
+        if self._count(win_30, "PERCLOS") >= 4 and self._count(win_30, "EYE_CLOSED_MS") >= 3:
             forced_level = max(forced_level, 3)
-            reasons.append("PERCLOS_TC_CROSS")
+            reasons.append("PERCLOS_MICROSLEEP_CROSS")
 
-        if self._count(win_5, "PITCH") >= 3 or self._count(win_5, "HEAD_DROP_VELOCITY") >= 3:
+        # Racha de cabeceos en 5 min.
+        if self._count(win_5, "PITCH") >= 3:
             forced_level = max(forced_level, 2)
             reasons.append("HEAD_NOD_CLUSTER")
 
-        if self._count(win_30, "BLINK_FB") >= 6:
+        # Racha de bostezos en 30 min.
+        if self._count(win_30, "MAR") >= 3:
             forced_level = max(forced_level, 1)
-            reasons.append("YAWN_OR_BLINK_CLUSTER")
-
-        if self._count(win_60, "MONOTONY") >= 5 and self._count(win_60, "TIME_ON_TASK") >= 5:
-            if self._uninterrupted_start_ts is None:
-                self._uninterrupted_start_ts = now_ts
-            forced_level = max(forced_level, 2)
-            reasons.append("LONG_TASK_MONOTONY")
-
-        # Conduccion ininterrumpida: una vez activada, persiste mientras TIME_ON_TASK siga ocurriendo
-        if self._uninterrupted_start_ts is not None:
-            win_5_local = self.event_store.window(now_ts, 5 * 60)
-            if self._count(win_5_local, "TIME_ON_TASK") >= 1:
-                forced_level = max(forced_level, 2)
-                if "LONG_TASK_MONOTONY" not in reasons:
-                    reasons.append("UNINTERRUPTED_DRIVING")
-            else:
-                self._uninterrupted_start_ts = None
+            reasons.append("YAWN_CLUSTER")
 
         return {"forced_min_level": forced_level, "reasons": reasons}
 
     def run(self) -> None:
         while not self._stop_event.is_set():
-            now_ts = time.time()
+            now_ts = time.monotonic()
             data = self._evaluate(now_ts)
             with self._lock:
                 self._latest = data
@@ -87,8 +79,8 @@ class RuleEngine(threading.Thread):
 
 if __name__ == "__main__":
     es = EventStore()
-    t = time.time()
-    es.append({"timestamp": t, "paramid": "BLINK_TC", "eventflag": True, "value": 2200})
+    t = time.monotonic()
+    es.append({"timestamp": t, "paramid": "EYE_CLOSED_MS", "eventflag": True, "value": 2200})
     engine = RuleEngine(es)
     engine.start()
     time.sleep(1.2)

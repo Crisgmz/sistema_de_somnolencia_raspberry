@@ -52,15 +52,10 @@ PARAM_FAMILY: Dict[str, str] = {
     "YAW": "CABEZA",
     "HEAD_DROP_VELOCITY": "CABEZA",
     "HEAD_RECOVERY": "CABEZA",
-    "HEAD_MICRO_OSC": "CABEZA",
     # Facial (soporte)
     "FACIAL_ASYMMETRY": "FACIAL",
     "MUSCLE_TONE": "FACIAL",
     "LANDMARK_STABILITY": "FACIAL",
-    # Manos (soporte)
-    "FACE_TOUCH_FREQ": "MANOS",
-    "FACE_TOUCH_DUR": "MANOS",
-    "EYE_RUB": "MANOS",
     # Contexto (modulador)
     "ILLUMINATION": "CONTEXTO",
     "CIRCADIAN": "CONTEXTO",
