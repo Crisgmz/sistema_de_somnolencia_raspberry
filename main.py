@@ -1111,7 +1111,11 @@ class SomnolenciaSystem:
                     fps_count = 0
                     last_fps_ts = ts
                 if ts - last_health_log_ts >= 10.0:
-                    print(f"[INFO] Sistema activo | FPS={fps:.1f} | nivel={score_out['level']} | score={score_out['fatigue_score']}")
+                    print(
+                        f"[INFO] Sistema activo | FPS={fps:.1f} | nivel={score_out['level']} "
+                        f"score={score_out['fatigue_score']} | ear={float(pv.get('EAR',0.0)):.2f} "
+                        f"perclos={float(pv.get('PERCLOS',0.0)):.2f} emerg={emergency.get('reasons',[])}"
+                    )
                     last_health_log_ts = ts
 
                 alert_memory = self.alert_memory.update(

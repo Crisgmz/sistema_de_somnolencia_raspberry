@@ -39,6 +39,10 @@ class AlertDispatcher:
     def __init__(self, buzzer: Buzzer, mqtt: MqttPublisher) -> None:
         self.buzzer = buzzer
         self.mqtt = mqtt
+        # Retardo antirebote antes de sonar (configurable). Bajo = suena mas rapido.
+        # Con el override EYE_CLOSED_MS_FAST forzando nivel 2 a 1.5s, un retardo ~0
+        # hace que el buzzer suene a ~1.5s del cierre.
+        self.sound_delay_s = _env_f("SOMNO_SOUND_DELAY_S", self.SOUND_DELAY_S)
         self._effective_level = 0
         self._level_since_ts = 0.0
         self._last_mqtt_signature: tuple = ()
@@ -89,7 +93,7 @@ class AlertDispatcher:
             self._sound_candidate_level = level
             self._sound_candidate_since_ts = now
             return 0
-        if (now - self._sound_candidate_since_ts) < self.SOUND_DELAY_S:
+        if (now - self._sound_candidate_since_ts) < self.sound_delay_s:
             return 0
         return level
 

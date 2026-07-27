@@ -30,23 +30,33 @@ def _env_f(name: str, default: float) -> float:
 
 
 # Ojos cerrados de forma continua >= este umbral => emergencia (buzzer fijo).
-EYE_CLOSED_EMERGENCY_MS = _env_f("SOMNO_EYE_CLOSED_EMERGENCY_MS", 2000.0)
+# El umbral se lee dentro de detect_emergency (no a nivel de modulo) para que
+# respete el .env, que se carga DESPUES de importar este modulo.
 HEAD_DOWN_FIXED_BUZZER_S = 6.0
 
 
 def detect_emergency(metrics: Dict) -> Dict:
     pitch_delta = float(metrics.get("pitch_delta", metrics.get("pitch", 0.0)))
     # En este pipeline, pitch negativo representa inclinacion hacia abajo.
-    head_down = pitch_delta <= -HEAD_DOWN_THRESHOLD_DEG
+    # Umbrales/activacion leidos por llamada para respetar el .env (cargado tras
+    # importar este modulo). El trigger de cabeza-abajo depende de la pose de
+    # solvePnP, INESTABLE cerca de rostro frontal (pitch ~180): saltaba a valores
+    # negativos y disparaba PROLONGED_HEAD_DOWN en falso con la cabeza recta. Se
+    # puede desactivar (SOMNO_HEAD_DOWN_EMERGENCY=0) hasta tener correccion de pose.
+    head_down_deg = _env_f("SOMNO_HEAD_DOWN_DEG", HEAD_DOWN_THRESHOLD_DEG)
+    head_down_s_thr = _env_f("SOMNO_HEAD_DOWN_S", HEAD_DOWN_FIXED_BUZZER_S)
+    head_down_enabled = os.getenv("SOMNO_HEAD_DOWN_EMERGENCY", "1").strip().lower() in ("1", "true", "yes", "on")
+    head_down = pitch_delta <= -head_down_deg
     eye_closed_ms = float(metrics.get("eye_closed_ms", metrics.get("blink_tc_ms", 0.0)))
     head_down_s = float(metrics.get("head_down_s", 0.0))
 
+    eye_closed_emergency_ms = _env_f("SOMNO_EYE_CLOSED_EMERGENCY_MS", 2000.0)
     reasons: List[str] = []
     fixed_buzzer = False
-    if eye_closed_ms >= EYE_CLOSED_EMERGENCY_MS:
+    if eye_closed_ms >= eye_closed_emergency_ms:
         reasons.append("LOSS_OF_CONSCIOUSNESS")
         fixed_buzzer = True
-    if head_down and head_down_s >= HEAD_DOWN_FIXED_BUZZER_S:
+    if head_down_enabled and head_down and head_down_s >= head_down_s_thr:
         reasons.append("PROLONGED_HEAD_DOWN")
         fixed_buzzer = True
 

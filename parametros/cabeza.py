@@ -141,7 +141,7 @@ class CabezaParametros:
         # generaban falsos positivos; quedan como telemetria (la emergencia
         # medica sigue leyendo sus VALORES, no sus eventflags).
         return {
-            "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), calibration.calibrated and abs(pitch_delta) >= 24.0, 5, ts=ts),
+            "PITCH": build_param_output("PITCH", pitch, normalize_linear(abs(pitch_delta), 12.0, 30.0), False, 0, ts=ts),
             "ROLL": build_param_output("ROLL", roll, normalize_linear(abs(angle_delta_deg(roll, calibration.roll_neutral)), 12.0, 40.0), False, 0, ts=ts),
             "YAW": build_param_output("YAW", yaw, normalize_linear(abs(angle_delta_deg(yaw, calibration.yaw_neutral)), 15.0, 45.0), False, 0, ts=ts),
             "HEAD_DROP_VELOCITY": build_param_output("HEAD_DROP_VELOCITY", velocity, normalize_linear(abs(velocity), 12.0, 45.0), False, 0, ts=ts),

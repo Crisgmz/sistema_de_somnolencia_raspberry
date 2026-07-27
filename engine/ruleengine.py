@@ -8,6 +8,7 @@ nivel 2 sin ninguna evidencia fisiologica del conductor.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Dict, List
@@ -37,6 +38,12 @@ class RuleEngine(threading.Thread):
         return sum(1 for e in events if e.get("paramid") == paramid and e.get("eventflag"))
 
     def _evaluate(self, now_ts: float) -> Dict:
+        # Las reglas de ventana FUERZAN un nivel minimo por el historial de 5-30
+        # min (p.ej. 3 bostezos -> FATIGA por 30 min), desacoplado del score
+        # actual. Util para fatiga acumulada, pero en un demo el nivel debe seguir
+        # al estado ACTUAL (score 0 -> NORMAL). Se puede desactivar por entorno.
+        if os.getenv("SOMNO_RULES_ENABLED", "1").strip().lower() not in ("1", "true", "yes", "on"):
+            return {"forced_min_level": 0, "reasons": []}
         win_5 = self.event_store.window(now_ts, 5 * 60)
         win_30 = self.event_store.window(now_ts, 30 * 60)
         forced_level = 0
