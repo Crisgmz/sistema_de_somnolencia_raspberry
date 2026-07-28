@@ -66,6 +66,13 @@ class OjosParametros:
         self.blink_active = False
         self.blink_start_ts: Optional[float] = None
         self.eye_closed_event_reported = False
+        # Timer de cierre CONTINUO para el microsueno, independiente de la
+        # histeresis de parpadeo. eye_closed_ms cuenta solo mientras el ojo esta
+        # REALMENTE cerrado (ear < close_thr). Antes se medía desde el inicio del
+        # parpadeo aunque el ojo se reabriera dentro de la banda de histeresis:
+        # con lentes (EAR de reposo ~0.20, dentro de la banda) se atascaba y
+        # eye_closed_ms crecia hasta disparar falsos microsuenos/emergencias.
+        self._closed_start: Optional[float] = None
         self.blink_min_ear = 1.0
         self.last_tc_ms = 0.0
         self.last_amp = 0.0
@@ -148,9 +155,18 @@ class OjosParametros:
         fb_per_min = float(len(self.blink_times))
         ibi_s = float(np.mean(self.ibi_hist)) if self.ibi_hist else 0.0
         fixation_s = self._update_fixation(ts, left_eye_center, right_eye_center)
+        # eye_closed_ms = duracion de cierre CONTINUO (ear < close_thr). Se
+        # reinicia en cuanto el ojo sube por encima de close_thr (aunque siga en
+        # la banda de histeresis), evitando el atasco que inflaba el microsueno.
+        if reliable and ear < close_thr:
+            if self._closed_start is None:
+                self._closed_start = ts
+        else:
+            self._closed_start = None
+            self.eye_closed_event_reported = False
         eye_closed_ms = 0.0
-        if self.blink_active and self.blink_start_ts is not None:
-            eye_closed_ms = max(0.0, (ts - self.blink_start_ts) * 1000.0)
+        if self._closed_start is not None:
+            eye_closed_ms = max(0.0, (ts - self._closed_start) * 1000.0)
 
         # Microsueno: solo cuenta con calibracion terminada, para no puntuar
         # mientras el baseline aun se esta asentando.
