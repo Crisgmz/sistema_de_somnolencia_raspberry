@@ -1,0 +1,31 @@
+id,escenario,condicion_real,prediccion,notas
+1,"microsueno: ojos cerrados 2-3 s, de frente",SOMNOLIENTO,ALERTA,nivel_max=2;emergencia
+2,"microsueno: ojos cerrados 2-3 s, de frente",SOMNOLIENTO,ALERTA,nivel_max=2;emergencia
+3,"microsueno: ojos cerrados 2-3 s, de frente",SOMNOLIENTO,ALERTA,nivel_max=2;emergencia
+4,microsueno con lentes: ojos cerrados 2-3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+5,microsueno con lentes: ojos cerrados 2-3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+6,microsueno con lentes: ojos cerrados 2-3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+7,somnolencia gradual: parpadeo pesado + cierres >1 s repetidos (PERCLOS),SOMNOLIENTO,ALERTA,nivel_max=4
+8,somnolencia gradual: parpadeo pesado + cierres >1 s repetidos (PERCLOS),SOMNOLIENTO,ALERTA,nivel_max=4
+9,somnolencia gradual: parpadeo pesado + cierres >1 s repetidos (PERCLOS),SOMNOLIENTO,ALERTA,nivel_max=4
+10,cabeceo: caida de cabeza sostenida >=3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+11,cabeceo: caida de cabeza sostenida >=3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+12,cabeceo: caida de cabeza sostenida >=3 s,SOMNOLIENTO,ALERTA,nivel_max=4;emergencia
+13,bostezo sostenido >=2 s (con y sin mano tapando parcialmente),SOMNOLIENTO,NO_ALERTA,nivel_max=0
+14,bostezo sostenido >=2 s (con y sin mano tapando parcialmente),SOMNOLIENTO,NO_ALERTA,nivel_max=0
+15,bostezo sostenido >=2 s (con y sin mano tapando parcialmente),SOMNOLIENTO,NO_ALERTA,nivel_max=0
+16,"conduccion normal: mirada al frente, parpadeo natural",NORMAL,NO_ALERTA,nivel_max=1
+17,"conduccion normal: mirada al frente, parpadeo natural",NORMAL,NO_ALERTA,nivel_max=0
+18,"conduccion normal: mirada al frente, parpadeo natural",NORMAL,NO_ALERTA,nivel_max=0
+19,conduccion normal con lentes,NORMAL,NO_ALERTA,nivel_max=0
+20,conduccion normal con lentes,NORMAL,NO_ALERTA,nivel_max=0
+21,conduccion normal con lentes,NORMAL,NO_ALERTA,nivel_max=0
+22,hablar/reir/cantar (movimiento de boca sin bostezo),NORMAL,NO_ALERTA,nivel_max=1
+23,hablar/reir/cantar (movimiento de boca sin bostezo),NORMAL,NO_ALERTA,nivel_max=0
+24,hablar/reir/cantar (movimiento de boca sin bostezo),NORMAL,NO_ALERTA,nivel_max=0
+25,mirar espejos/tablero: giros de cabeza breves,NORMAL,NO_ALERTA,nivel_max=0
+26,mirar espejos/tablero: giros de cabeza breves,NORMAL,NO_ALERTA,nivel_max=0
+27,mirar espejos/tablero: giros de cabeza breves,NORMAL,NO_ALERTA,nivel_max=0
+28,"poca luz o contraluz, conductor despierto",NORMAL,NO_ALERTA,nivel_max=0
+29,"poca luz o contraluz, conductor despierto",NORMAL,NO_ALERTA,nivel_max=0
+30,"poca luz o contraluz, conductor despierto",NORMAL,NO_ALERTA,nivel_max=0

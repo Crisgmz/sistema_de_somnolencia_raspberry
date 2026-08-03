@@ -28,7 +28,10 @@ import os
 import sys
 import time
 
-NIVEL_ALERTA = 2  # nivel comprometido >= 2 (SOMNOLENCIA) cuenta como ALERTA
+# Criterio de ALERTA para la matriz: cuenta como ALERTA si el nivel comprometido
+# llega a 2 (SOMNOLENCIA), 3 (CRITICO) o 4 (EMERGENCIA), o si hay emergencia.
+# NORMAL (0) y FATIGA (1) NO cuentan como alerta.
+NIVEL_ALERTA = 2
 
 
 def jsonl_mas_reciente(directorio: str) -> str | None:
@@ -75,7 +78,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Corredor guiado: llena 'prediccion' desde el JSONL en vivo")
     ap.add_argument("csv", help="CSV de pruebas (de tools/evaluar_matriz.py --plantilla)")
     ap.add_argument("--jsonl", help="JSONL de sesion en vivo (default: el mas reciente en recordings/)")
-    ap.add_argument("--duracion", type=float, default=30.0, help="segundos por prueba (default 30)")
+    ap.add_argument("--duracion", type=float, default=10.0, help="segundos por prueba (default 10)")
     args = ap.parse_args()
 
     jsonl_path = args.jsonl or jsonl_mas_reciente(os.getenv("SOMNO_RECORD_DIR", "recordings"))

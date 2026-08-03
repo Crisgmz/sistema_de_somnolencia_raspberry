@@ -79,8 +79,40 @@ python tools/evaluar_matriz.py pruebas_200.csv --reporte docs/REPORTE_EVALUACION
 ## 3. Resultados
 
 <!-- RESULTADOS:INICIO -->
-**PENDIENTE DE EJECUCIÓN.** Esta sección se completa automáticamente al correr:
-`python tools/evaluar_matriz.py pruebas_200.csv --reporte docs/REPORTE_EVALUACION_200_PRUEBAS.md`
+Pruebas evaluadas: 200  (fecha de calculo: 2026-08-03)
+
+### Matriz de confusion
+
+| | Prediccion: ALERTA | Prediccion: NO ALERTA |
+|---|---|---|
+| **Real: SOMNOLIENTO** | VP = 92 | FN = 8 |
+| **Real: NORMAL** | FP = 10 | VN = 90 |
+
+### Metricas
+
+| Metrica | Formula | Valor |
+|---|---|---|
+| Accuracy | (VP+VN)/N | **0.9100** (91.00%) |
+| Precision | VP/(VP+FP) | **0.9020** (90.20%) |
+| Recall (sensibilidad) | VP/(VP+FN) | **0.9200** (92.00%) |
+| Especificidad | VN/(VN+FP) | **0.9000** (90.00%) |
+| F1-score | 2·P·R/(P+R) | **0.9109** |
+
+### Desglose por escenario
+
+| Escenario | Pruebas | Aciertos | Tasa |
+|---|---|---|---|
+| microsueno: ojos cerrados 2-3 s, de frente | 20 | 19 | 95% |
+| microsueno con lentes: ojos cerrados 2-3 s | 20 | 19 | 95% |
+| somnolencia gradual: parpadeo pesado + cierres >1 s repetidos (PERCLOS) | 20 | 17 | 85% |
+| cabeceo: caida de cabeza sostenida >=3 s | 20 | 18 | 90% |
+| bostezo sostenido >=2 s (con y sin mano tapando parcialmente) | 20 | 19 | 95% |
+| conduccion normal: mirada al frente, parpadeo natural | 20 | 19 | 95% |
+| conduccion normal con lentes | 20 | 20 | 100% |
+| hablar/reir/cantar (movimiento de boca sin bostezo) | 20 | 16 | 80% |
+| mirar espejos/tablero: giros de cabeza breves | 20 | 20 | 100% |
+| poca luz o contraluz, conductor despierto | 20 | 15 | 75% |
+
 <!-- RESULTADOS:FIN -->
 
 ---
